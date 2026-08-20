@@ -127,3 +127,40 @@
 - **Consequences:**
   - One source of truth for style and types; PRs only need to pass CI.
   - We can add `pre-commit` later if we want local enforcement.
+
+---
+
+## D-009 · Shallow `git clone` via `subprocess`, not GitPython
+
+- **Date:** 2026-08-20
+- **Status:** Accepted
+- **Context:** Ingestion (day-02-github-ingestion) needs a working copy of
+  an arbitrary GitHub repository given only a URL. Two options were
+  considered: shell out to the system `git` binary via `subprocess`, or
+  depend on `GitPython` for a nicer Python API around the same binary.
+- **Decision:** Shell out to `git clone --depth 1 -- <url> <dest>` via
+  `subprocess.run(...)` with an explicit argument list (never
+  `shell=True`) and an enforced `timeout`. Reject any URL whose scheme is
+  not `https` (`ssh://`, `git://`, `ext::`, `file://`, etc.) before ever
+  invoking `git`. `GitPython` was rejected: it is a thin wrapper around
+  the same `git` binary and buys nothing for a single shallow-clone call,
+  at the cost of a new pip dependency.
+- **Consequences:**
+  - This is **not** a shell-injection concern — `git` is always invoked
+    with an argument list, never through a shell. The real risks closed
+    by the `https`-only restriction are SSRF / protocol abuse (git's
+    `ssh://` and `ext::` transports can reach internal hosts or leak
+    credentials via `.netrc` / an active SSH agent) and unbounded
+    resource use from a hostile or slow/oversized remote — the clone
+    timeout closes the latter.
+  - No new pip dependency; requires a system `git` binary on `PATH`
+    (already implicit for a project developed inside a git repo).
+  - Clones land under `DATA_DIR/clones/<unique>` and are **not**
+    automatically deleted by ingestion — cleanup is opt-in via
+    `RepoSource.cleanup()`. Automatic lifecycle management (delete-
+    after-index, LRU eviction of stale clones) is deliberately deferred
+    to whichever later day wires ingestion into the `index`/`serve` CLI
+    flow.
+  - Revisit if we need `git` operations beyond a single shallow clone
+    (e.g. incremental fetch/pull for re-indexing), where `GitPython`'s
+    richer API might start to pay for itself.

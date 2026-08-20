@@ -54,6 +54,7 @@ coverage.xml
 
 # --- Project data / indexes ---
 data/
+data/clones/
 *.faiss
 *.index
 *.pkl
