@@ -58,10 +58,27 @@ flowchart LR
 to `INDEX_DIR`, and exit. Subsequent `codebase-rag serve` invocations
 load the persisted indexes instead of rebuilding them.
 
+Ingestion (`ingestion/loader.py` → `ingestion/filters.py` /
+`ingestion/languages.py` → `ingestion/scanner.py`) accepts either an
+`https://` GitHub URL — shallow-cloned via `subprocess` + the system
+`git` into `DATA_DIR/clones/` — or a local directory path, then walks
+the checkout applying ignore rules and extension-based language
+detection to produce the `RepoStats` / `FileRecord` list consumed by
+the parser stage below.
+
 ```mermaid
 flowchart TD
-    A[Target codebase path] --> B[ingestion<br/>file discovery]
-    B --> C[parser<br/>tree-sitter AST]
+    A[Target: https:// GitHub URL or local path] --> B1[ingestion.loader<br/>load_repo]
+    B1 --> B2{https URL or local path?}
+    B2 -->|https URL| B3[git clone --depth 1<br/>subprocess, timeout-enforced]
+    B2 -->|local path| B4[validate exists + is directory]
+    B3 --> B5[ingestion.scanner<br/>scan]
+    B4 --> B5
+    B5 --> B6[ingestion.filters<br/>dir / lockfile / binary / size rules]
+    B5 --> B7[ingestion.languages<br/>extension to language]
+    B6 --> B8[RepoStats + FileRecord list]
+    B7 --> B8
+    B8 --> C[parser<br/>tree-sitter AST]
     C --> D[chunker<br/>AST-aware splits]
     D --> E[indexing.vector<br/>FAISS + embeddings]
     D --> F[indexing.bm25<br/>rank-bm25]
