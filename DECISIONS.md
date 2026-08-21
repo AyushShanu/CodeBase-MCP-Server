@@ -164,3 +164,135 @@
   - Revisit if we need `git` operations beyond a single shallow clone
     (e.g. incremental fetch/pull for re-indexing), where `GitPython`'s
     richer API might start to pay for itself.
+
+---
+
+## D-010 · Tree-sitter grammar loading via `tree-sitter-language-pack`
+
+- **Date:** 2026-08-21
+- **Status:** Accepted
+- **Context:** Day 03 (tree-sitter-chunking) needs Tree-sitter `Parser`/
+  `Language` objects for TypeScript, TSX, JavaScript, and Python.
+- **Decision:** Load grammars via `tree_sitter_language_pack.get_parser`/
+  `get_language`, wrapped in `parser/grammars.py` behind `functools.cache`
+  (the pack's own wrapper does not itself guarantee memoized construction).
+  One dependency covers every grammar needed, with no manual
+  `Language(...)` wiring per language.
+- **Alternatives considered:** individual per-language packages
+  (`tree-sitter-typescript`, `tree-sitter-javascript`, `tree-sitter-python`,
+  ...) — more explicit pinning per grammar, but N extra dependencies for N
+  languages. Rejected: no benefit at this scale, and
+  `tree-sitter-language-pack` was already the declared dependency from the
+  Day 01 scaffold.
+- **Consequences:**
+  - `.tsx` files must be routed to the pack's `"tsx"` grammar name, not
+    `"typescript"` — `ingestion.languages` maps both `.ts`/`.tsx` to the
+    single string `"typescript"`, and parsing JSX with the plain
+    TypeScript grammar produces a broken parse. `resolve_grammar_name`
+    takes an optional `path` hint purely for this routing; the public
+    `ParseResult.language`/`Chunk.language` stay `"typescript"` either way.
+
+---
+
+## D-011 · Hand-rolled recursive AST walk, not Query/QueryCursor or `process()`
+
+- **Date:** 2026-08-21
+- **Status:** Accepted
+- **Context:** `tree-sitter-language-pack` 1.14.3 offers three ways to
+  extract structure: raw `Query`/`QueryCursor` (this version's split API —
+  `Query(language, src)` then `QueryCursor(query).captures(node)`, not the
+  older `Language.query()`/`Query.captures()` shape), a built-in
+  `get_tags_query()` per language, and a high-level `process()` that
+  returns a pre-walked structure tree.
+- **Decision:** Hand-roll a recursive `Node` walk per language family
+  (`parser/extractor.py`'s `_dispatch_ts_js`/`_dispatch_python`) instead.
+- **Consequences:**
+  - The hardest requirement — qualifying a nested method as
+    `f"{class_name}.{method_name}"` — needs explicit "what class am I
+    currently inside" context threaded through the walk. Query captures
+    return flat, parent-context-free node lists; a query-based approach
+    would still need a manual `.parent` walk to recover that context, so
+    Query buys nothing on the one thing that's hard.
+  - `process()`/`get_tags_query()` have their own unverified conventions
+    for anonymous-export naming and qualification; a hand-rolled walk
+    gives full, directly testable control over which node types continue
+    recursion vs. stop (keeping `.map(callback)`-style inline arrow
+    functions and nested helpers out of the top-level symbol list) and
+    over the enclosing-class-name tracking.
+  - Costs more code than a one-line query per language; acceptable given
+    the precision this pipeline's citation requirements demand.
+
+---
+
+## D-012 · `DEFAULT_MAX_CHUNK_LINES = 100` fallback-splitting threshold
+
+- **Date:** 2026-08-21
+- **Status:** Accepted
+- **Context:** `chunker/fallback.py` must split an oversized symbol along
+  in-span line boundaries once it exceeds a configurable line budget.
+- **Decision:** Default to 100 lines, defined locally in `fallback.py`
+  (mirroring `ingestion/filters.py`'s `DEFAULT_MAX_FILE_SIZE_BYTES`
+  placement — a module-local `Final` constant, not `config.py`).
+- **Consequences:** The stack's default local embedding model
+  (`all-MiniLM-L6-v2`, per CLAUDE.md) has a small context window
+  (~256–384 tokens for MiniLM-class models). ~100 lines of code is
+  roughly 500–800 tokens — generous enough that ordinary functions/methods
+  are never split, but small enough to keep a genuinely oversized function
+  from silently truncating (and losing citation/retrieval quality) at
+  embedding time in Day 04. Threaded through `chunk_file(...,
+  max_chunk_lines=...)` as an overridable keyword default.
+
+---
+
+## D-013 · Qualified `ClassName.method` naming for nested symbols
+
+- **Date:** 2026-08-21
+- **Status:** Accepted
+- **Context:** Two different classes can define a same-named method (e.g.
+  both have `render()`); a bare method name would collide across classes
+  in the symbol/chunk index and in a future `find_symbol` MCP tool.
+- **Decision:** `ParsedSymbol.name`/`Chunk.symbol` for a class-nested
+  method is always `f"{class_name}.{method_name}"`, never a bare name.
+  Anonymous classes/functions/default exports get a literal `"default"`
+  name rather than being silently dropped.
+- **Consequences:** Citations for methods are self-describing without
+  needing the enclosing chunk's file path for disambiguation. `find_symbol`
+  (Day 10) can match on either the qualified name or a suffix.
+
+---
+
+## D-014 · Pin `tree-sitter` to `<0.26` — 0.26.0 has a memory-corruption regression
+
+- **Date:** 2026-08-21
+- **Status:** Accepted
+- **Context:** While running Day 03's manual smoke test against a real
+  TypeScript file (`p-queue`'s `source/index.ts`, 1001 lines), extracted
+  symbols reported wildly incorrect `end_line` values (up to 27921 in a
+  1001-line file) and the Python process segfaulted. Bisection (see
+  below) isolated this to the `tree-sitter` core package itself, version
+  0.26.0 — not `tree-sitter-language-pack`, not this project's extraction
+  logic, and not something specific to Unicode/emoji content (reproduced
+  on an ASCII-only copy of the same file). A purely synthetic file with
+  the same shape (one class, 85 trivial methods) did **not** reproduce it,
+  so this is triggered by some structural complexity in real-world
+  TypeScript (deep generics, private `#field`s, decorators, etc.)
+  combined with a longer walk, not raw node count alone.
+- **Decision:** Cap the dependency at `tree-sitter>=0.23,<0.26` (was
+  `>=0.23` with no ceiling). Verified via a throwaway virtualenv,
+  bisecting exact version pairs against the same real-world fixture file:
+  - `tree-sitter==0.26.0` + `tree-sitter-language-pack==1.14.3` → corrupted, segfaults.
+  - `tree-sitter==0.26.0` + `tree-sitter-language-pack==1.0.0` → still corrupted (different garbage value) — confirms the regression is in `tree-sitter` core, not the language pack.
+  - `tree-sitter==0.25.2` + `tree-sitter-language-pack==1.14.3` (latest pack) → correct, no crash.
+  - `tree-sitter==0.24.0` + `tree-sitter-language-pack==1.14.3` → correct, no crash.
+
+  The installed venv was reinstalled to `tree-sitter==0.25.2` (newest
+  version confirmed clean, paired with the already-installed
+  `tree-sitter-language-pack==1.14.3`).
+- **Consequences:**
+  - Re-running the same smoke test after the downgrade produces correct,
+    in-file line ranges and no crash across all four `p-queue` source
+    files tested.
+  - Revisit this ceiling once a `tree-sitter` release past 0.26.0 exists
+    and can be verified clean against this same fixture file (or once the
+    upstream issue is identified/fixed upstream — this was not filed
+    upstream as part of this session, worth doing before lifting the cap).
