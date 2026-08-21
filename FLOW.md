@@ -66,6 +66,24 @@ the checkout applying ignore rules and extension-based language
 detection to produce the `RepoStats` / `FileRecord` list consumed by
 the parser stage below.
 
+Parsing and chunking (`parser/extractor.py:parse_file` →
+`chunker/chunker.py:chunk_file`, using `chunker/fallback.py:
+split_oversized_symbol` for any symbol whose span exceeds
+`DEFAULT_MAX_CHUNK_LINES`) each operate on **one file at a time** — given
+a `FileRecord.path`/`language` and that file's raw bytes, `parse_file`
+resolves a Tree-sitter grammar (`parser/grammars.py`, `.tsx` routed to
+the `"tsx"` grammar even though ingestion reports it as `"typescript"`)
+and hand-walks the AST into a `ParseResult` (functions/classes/methods/
+interfaces with 1-indexed line ranges, qualified `ClassName.method`
+names for nested symbols); `chunk_file` then decodes the file's bytes to
+text exactly once and slices one `Chunk` per symbol (or a single
+whole-file fallback `Chunk` if a file has none). **There is no
+repo-wide orchestration here yet** — looping `parse_file`/`chunk_file`
+over every `FileRecord` in a `RepoStats` and aggregating the resulting
+chunks into one collection is Day 04's job (the embedding stage is the
+first consumer that actually needs "all chunks for the repo" as a single
+collection).
+
 ```mermaid
 flowchart TD
     A[Target: https:// GitHub URL or local path] --> B1[ingestion.loader<br/>load_repo]
@@ -78,15 +96,24 @@ flowchart TD
     B5 --> B7[ingestion.languages<br/>extension to language]
     B6 --> B8[RepoStats + FileRecord list]
     B7 --> B8
-    B8 --> C[parser<br/>tree-sitter AST]
-    C --> D[chunker<br/>AST-aware splits]
-    D --> E[indexing.vector<br/>FAISS + embeddings]
-    D --> F[indexing.bm25<br/>rank-bm25]
+    B8 --> C1[parser.grammars<br/>resolve_grammar_name + cached Parser]
+    C1 --> C2[parser.extractor<br/>parse_file: Tree-sitter AST walk]
+    C2 --> D1[chunker.chunker<br/>chunk_file: decode once, slice per symbol]
+    D1 -.oversized symbol.-> D2[chunker.fallback<br/>split_oversized_symbol]
+    D2 -.-> D1
+    D1 --> E[indexing.vector<br/>FAISS + embeddings]
+    D1 --> F[indexing.bm25<br/>rank-bm25]
     E --> G[(data/index/)]
     F --> G
-    D --> H[(chunk metadata)]
+    D1 --> H[(chunk metadata)]
     H --> G
 ```
+
+`parse_file`/`chunk_file` are exercised directly by
+`tests/test_parser.py`/`tests/test_chunker.py` and a manual smoke test
+today — the `E`/`F`/`G` boxes above (embedding, BM25, persisted indexes)
+remain aspirational until Day 04/05 land the repo-wide loop that actually
+calls them.
 
 ---
 

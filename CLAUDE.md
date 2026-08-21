@@ -70,7 +70,7 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` complete.
 - [ ] **02 — GitHub Ingestion & File Filtering** — `feature/github-ingestion`
   Accept a GitHub URL or local path, clone safely, detect languages, ignore `.git`/`node_modules`/`build`/`dist`/`coverage`/binaries/lockfiles/oversized files, return repo stats, ingestion tests.
 
-- [ ] **03 — Tree-sitter Parsing & AST Chunking** — `feature/tree-sitter-chunking`
+- [x] **03 — Tree-sitter Parsing & AST Chunking** — `feature/tree-sitter-chunking`
   Parsers for TS/JS first (Python if time allows). Extract functions/classes/methods/interfaces. Chunk by code structure, not character count. Store `repo, file, symbol, type, language, start_line, end_line`. Safe fallback splitting for oversized functions.
 
 - [ ] **04 — Embeddings & Vector Index** — `feature/embeddings-vector-index`
