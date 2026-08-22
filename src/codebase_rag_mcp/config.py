@@ -26,6 +26,14 @@ def _getenv(name: str, default: str = "") -> str:
     return value if value is not None else default
 
 
+def _getenv_int(name: str, default: int) -> int:
+    value = _getenv(name, str(default))
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 # --- Provider keys --------------------------------------------------------- #
 
 NVIDIA_API_KEY: Final[str] = _getenv("NVIDIA_API_KEY")
@@ -39,6 +47,12 @@ GEMINI_API_KEY: Final[str] = _getenv("GEMINI_API_KEY")
 LOCAL_MODEL_BASE_URL: Final[str] = _getenv("LOCAL_MODEL_BASE_URL", "http://localhost:11434/v1")
 LOCAL_MODEL_NAME: Final[str] = _getenv("LOCAL_MODEL_NAME")
 LOCAL_MODEL_API_KEY: Final[str] = _getenv("LOCAL_MODEL_API_KEY")
+
+
+# --- Embedding settings ----------------------------------------------------- #
+
+EMBEDDING_MODEL_NAME: Final[str] = _getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
+EMBEDDING_BATCH_SIZE: Final[int] = _getenv_int("EMBEDDING_BATCH_SIZE", 32)
 
 
 # --- Runtime configuration ------------------------------------------------- #
@@ -69,6 +83,8 @@ def provider_keys() -> ProviderKeys:
 
 __all__ = [
     "DATA_DIR",
+    "EMBEDDING_BATCH_SIZE",
+    "EMBEDDING_MODEL_NAME",
     "GEMINI_API_KEY",
     "GROQ_API_KEY",
     "INDEX_DIR",
