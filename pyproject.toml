@@ -30,6 +30,7 @@ dependencies = [
     "tree-sitter>=0.23,<0.26",
     "tree-sitter-language-pack>=0.6",
     "faiss-cpu>=1.8.0",
+    "numpy>=1.26",
     "rank-bm25>=0.2.2",
     "sentence-transformers>=3.0",
     "langchain-huggingface>=0.1",
@@ -75,7 +76,14 @@ quote-style = "double"
 indent-style = "space"
 
 [tool.mypy]
-python_version = "3.11"
+# Note: this governs the syntax mypy accepts while type-checking (including
+# third-party .pyi stubs), not this project's actual runtime Python support
+# -- that stays >=3.11 per `requires-python`/D-002. Bumped from 3.11 because
+# numpy's bundled stubs use PEP 695 `type` statements, which mypy refuses to
+# parse in any stub when `python_version` < 3.12 -- there's no supported
+# per-module override for this (mypy rejects `python_version` as a
+# per-module flag), so the setting is necessarily global. See DECISIONS.md.
+python_version = "3.12"
 strict = false
 warn_return_any = true
 warn_unused_configs = true
@@ -96,6 +104,7 @@ module = [
     "mcp.*",
 ]
 ignore_missing_imports = true
+
 
 [tool.pytest.ini_options]
 minversion = "8.0"

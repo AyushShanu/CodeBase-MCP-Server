@@ -296,3 +296,176 @@
     and can be verified clean against this same fixture file (or once the
     upstream issue is identified/fixed upstream — this was not filed
     upstream as part of this session, worth doing before lifting the cap).
+
+---
+
+## D-015 · Hand-rolled `faiss-cpu` `IndexFlatIP`, not `langchain_community.vectorstores.FAISS`
+
+- **Date:** 2026-08-21
+- **Status:** Accepted
+- **Context:** Day 04 (embeddings-vector-index) needs a persistent dense
+  vector index over `Chunk` embeddings. CLAUDE.md's stack table lists FAISS
+  as the primary vector store, but two implementation paths exist: the
+  `langchain_community.vectorstores.FAISS` wrapper (paired with
+  `HuggingFaceEmbeddings`, the "reference snippet" shape this stack was
+  originally sketched around), or hand-rolling directly against
+  `faiss-cpu`.
+- **Decision:** Hand-roll a thin layer (`indexing/vector.py`) directly
+  against `faiss.IndexFlatIP`, plus a custom chunk-metadata store, instead
+  of using `langchain_community.vectorstores.FAISS`.
+- **Alternatives considered:** `langchain_community.vectorstores.FAISS` —
+  rejected. Its docstore is keyed on LangChain `Document` objects
+  (`page_content`/`metadata: dict`), not this project's typed `Chunk`
+  Pydantic model; round-tripping every `Chunk` field losslessly through
+  that shape means either fighting the wrapper's assumptions or converting
+  back and forth at every boundary. It also manages normalization somewhat
+  opaquely depending on which distance strategy is configured, which
+  conflicts with wanting explicit, directly-tested control over
+  normalization (see D-016). A hand-rolled layer keeps `Chunk` the single
+  source of truth end to end and is consistent with D-011's own precedent
+  (Day 03's hand-rolled AST walk) of hand-rolling where precise control
+  matters more than reuse. `langchain-community` is deliberately **not**
+  added as a dependency for this.
+- **Consequences:**
+  - `indexing/vector.py` owns the full build/persist/load/query lifecycle
+    itself; no LangChain vectorstore abstraction sits between `Chunk` and
+    FAISS.
+  - Persistence is two plain files under `INDEX_DIR`: `vector.faiss`
+    (`faiss.write_index`/`read_index`) and `vector_metadata.json` (a JSON
+    array of `Chunk.model_dump(mode="json")`, positional index = FAISS
+    vector ID — no separate ID-mapping data structure needed).
+
+---
+
+## D-016 · `IndexFlatIP` over L2-normalized vectors for cosine similarity
+
+- **Date:** 2026-08-21
+- **Status:** Accepted
+- **Context:** Correct semantic search needs cosine similarity, but FAISS's
+  `IndexFlatIP` computes raw inner product, not cosine similarity, unless
+  every vector involved is unit-length.
+- **Decision:** Use `faiss.IndexFlatIP` (flat, brute-force — no
+  `IndexIVFFlat`/quantization needed at this corpus scale, tens of
+  thousands of chunks is trivial for CPU brute-force search) and enforce
+  L2-normalization in exactly one function (`indexing.vector._l2_normalize`),
+  applied to every vector added to the index **and** every query vector at
+  search time, via a single shared code path (`embed_texts`) so build-side
+  and query-side normalization can never drift apart.
+- **Alternatives considered:** `IndexFlatL2` (Euclidean distance) — would
+  require a separate distance-to-similarity conversion and doesn't map as
+  directly onto "most relevant chunk" ranking. `IndexIVFFlat`/quantized
+  indexes — unnecessary complexity at this scale; deferred until corpus
+  size actually demands it.
+- **Consequences:**
+  - A near-zero-norm vector (degenerate/empty embedding, which shouldn't
+    occur since empty-content chunks are filtered before embedding — see
+    D-017) is left as an all-zero row rather than dividing by ~0.
+  - Tested directly: `tests/test_indexing_vector.py` asserts every embedded
+    vector's L2 norm ≈ 1.0, and that querying with content identical to an
+    indexed chunk scores ≈ 1.0 (which only holds if both sides normalize
+    identically).
+
+---
+
+## D-017 · Single batched `embed_documents` call per `embed_texts` invocation; batch size 32
+
+- **Date:** 2026-08-21
+- **Status:** Accepted
+- **Context:** Embedding calls must never happen one-at-a-time per chunk
+  (prohibitively slow at "tens of thousands of chunks" scale on a laptop
+  CPU). Reading the installed `langchain_huggingface.HuggingFaceEmbeddings`
+  source directly showed `embed_documents(texts)` already forwards the full
+  list to `sentence_transformers.SentenceTransformer.encode(texts,
+  **encode_kwargs)` in one call, and `encode()` itself batches internally
+  via its own `batch_size` kwarg.
+- **Decision:** `indexing.vector.embed_texts` calls `embedder.embed_documents(texts)`
+  **once** with the complete text list, passing `batch_size` through
+  `encode_kwargs`, rather than manually chunking `texts` into slices and
+  issuing one `embed_documents` call per slice. Default
+  `EMBEDDING_BATCH_SIZE = 32` (config-driven, `.env`-overridable) — matches
+  `sentence-transformers`' own conventional default, a safe starting point
+  for short code-chunk texts on CPU.
+- **Alternatives considered:** manually chunking into `batch_size`-sized
+  slices with one `embed_documents` call per slice — rejected as redundant
+  complexity re-implementing batching `sentence-transformers` already does
+  internally (CLAUDE.md: no abstractions beyond what's needed); it would
+  also lose `sentence-transformers`' own internal length-based batching
+  optimizations across the whole input at once.
+- **Consequences:**
+  - `HuggingFaceEmbeddings` is constructed fresh per `embed_texts` call
+    (not cached via `functools.cache`, unlike `parser/grammars.py`'s
+    parser/language caching) specifically so tests can
+    `monkeypatch.setattr(vector, "HuggingFaceEmbeddings", FakeEmbeddings)`
+    per-test without a stale cached instance leaking across tests (no
+    `conftest.py`/fixture exists to clear an `lru_cache` between tests). A
+    module-level singleton is a reasonable optimization once Day 08 gives
+    the MCP server a real process lifecycle to hang it off — deliberately
+    deferred, not forgotten.
+
+---
+
+## D-018 · `collect_repo_chunks` also catches `UnsupportedLanguageError`/`ParseError`, not just file-read `OSError`
+
+- **Date:** 2026-08-21
+- **Status:** Accepted
+- **Context:** `ingestion.languages.EXTENSION_LANGUAGE_MAP` marks ~25
+  languages `included=True` (markdown, json, yaml, go, rust, java, ...),
+  but `parser.grammars.LANGUAGE_TO_GRAMMAR` only configures
+  `{typescript, javascript, python}`. `parser.extractor.parse_file` raises
+  `UnsupportedLanguageError` for anything else *by design* (per its own
+  docstring: "that gap must stay visible to the caller, not silently
+  swallowed"). Discovered while implementing Day 04's repo-wide
+  orchestration loop (`indexing.repo.collect_repo_chunks`): virtually any
+  real repository (which will have at least a README.md) hits this, so an
+  orchestrator that only guards the file-*read* step would crash on nearly
+  every real repo.
+- **Decision:** `collect_repo_chunks` wraps the `parse_file` call in
+  `try/except (UnsupportedLanguageError, ParseError)`, in addition to
+  wrapping the file read in `try/except OSError` — both failure modes
+  append a `FileReadFailure(path, reason)` and `continue` the loop rather
+  than aborting the whole-repo run. `chunk_file` itself is never wrapped
+  (confirmed by reading `chunker/chunker.py` — it decodes with
+  `errors="replace"` and never raises).
+- **Consequences:**
+  - A repo-wide chunk-collection run degrades gracefully on any file whose
+    language has no Tree-sitter grammar configured yet (markdown, json,
+    yaml, go, rust, ...) instead of crashing; the omission is recorded and
+    visible via `RepoChunkCollection.read_failures`, not silent.
+  - When Day 03's language coverage expands (Python was already optional;
+    further languages may be added later), fewer files will hit this path
+    — no code change needed here, the try/except degrades gracefully
+    either way.
+
+---
+
+## D-019 · Bump `[tool.mypy] python_version` to 3.12 (type-checking target only, not runtime support)
+
+- **Date:** 2026-08-21
+- **Status:** Accepted
+- **Context:** Day 04 adds a direct `numpy` dependency (`indexing/vector.py`
+  needs `np.ndarray` for embedding vectors). numpy's own bundled `.pyi`
+  stubs use PEP 695 `type` statement syntax, which mypy refuses to parse in
+  *any* stub file when `python_version` is set below `"3.12"` — this
+  applies to the stub's syntax, not our own code. mypy does not support a
+  per-module `python_version` override (confirmed: it rejects
+  `python_version` as a per-module flag), so a global bump was the only
+  option; `follow_imports = "skip"` on a numpy-only override was tried
+  first and did not avoid the parse error.
+- **Decision:** Bump `[tool.mypy] python_version` from `"3.11"` to
+  `"3.12"`. This governs only what syntax mypy accepts while
+  type-checking — it does **not** change this project's actual runtime
+  Python support, which remains `>=3.11` per `requires-python` and D-002.
+  Our own source code introduces no 3.12-only syntax as part of this
+  change.
+- **Alternatives considered:** `follow_imports = "skip"` for
+  `numpy`/`numpy.*` — tried, did not prevent mypy from parsing numpy's
+  `__init__.pyi` and hitting the same syntax error. Leaving `numpy` out of
+  static typing entirely (e.g. `# type: ignore` on the import) — rejected
+  as a workaround that would silently disable type-checking for every
+  numpy-typed value in `indexing/vector.py`, not just the stub-parsing
+  issue.
+- **Consequences:** mypy now accepts any 3.12-only syntax in our own code
+  too, without complaint — a minor relaxation of the guard D-002 originally
+  wanted, accepted as a reasonable trade-off to unblock a real, necessary
+  dependency. Revisit if this ever causes 3.12-only syntax to land
+  unintentionally in code meant to run on 3.11.

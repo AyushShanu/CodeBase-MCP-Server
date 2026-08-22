@@ -77,12 +77,34 @@ and hand-walks the AST into a `ParseResult` (functions/classes/methods/
 interfaces with 1-indexed line ranges, qualified `ClassName.method`
 names for nested symbols); `chunk_file` then decodes the file's bytes to
 text exactly once and slices one `Chunk` per symbol (or a single
-whole-file fallback `Chunk` if a file has none). **There is no
-repo-wide orchestration here yet** — looping `parse_file`/`chunk_file`
-over every `FileRecord` in a `RepoStats` and aggregating the resulting
-chunks into one collection is Day 04's job (the embedding stage is the
-first consumer that actually needs "all chunks for the repo" as a single
-collection).
+whole-file fallback `Chunk` if a file has none).
+
+Repo-wide orchestration (`indexing/repo.py:collect_repo_chunks`) is the
+first place `parse_file`/`chunk_file` get looped over an entire
+`RepoStats`: for every `included=True` `FileRecord`, it reads
+`root / file.path`, calls `parse_file` (with the repo-relative, not
+physical, path -- see D-018) then `chunk_file`, and aggregates every
+file's chunks into one `list[Chunk]` for the whole repo. A file that
+can't be read (`OSError`), or whose language has no configured
+Tree-sitter grammar yet (`UnsupportedLanguageError`) or that Tree-sitter
+can't parse at all (`ParseError`), is recorded into
+`RepoChunkCollection.read_failures` (path + reason) rather than aborting
+the run -- see D-018 for why the language/parse-error case matters in
+practice (most real repos have at least a README.md, which has no
+grammar configured today).
+
+Embedding (`indexing/vector.py:embed_chunks` → `embed_texts` →
+`build_index`) takes that aggregated `list[Chunk]`, filters out any
+chunk with empty/whitespace-only `content` (recorded as a `SkippedChunk`,
+never silently dropped), and embeds the rest locally via
+`langchain_huggingface.HuggingFaceEmbeddings` (`all-MiniLM-L6-v2` by
+default, see `config.EMBEDDING_MODEL_NAME`/`EMBEDDING_BATCH_SIZE`) in a
+single batched call per `embed_texts` invocation (D-017). Every resulting
+vector is L2-normalized in one place (`_l2_normalize`) so the persisted
+FAISS `IndexFlatIP` (D-015/D-016) performs a correct cosine-similarity
+search — the same normalization path is reused at query time
+(`VectorIndex.query`) so build-side and query-side vectors are always
+comparable.
 
 ```mermaid
 flowchart TD
@@ -101,19 +123,19 @@ flowchart TD
     C2 --> D1[chunker.chunker<br/>chunk_file: decode once, slice per symbol]
     D1 -.oversized symbol.-> D2[chunker.fallback<br/>split_oversized_symbol]
     D2 -.-> D1
-    D1 --> E[indexing.vector<br/>FAISS + embeddings]
-    D1 --> F[indexing.bm25<br/>rank-bm25]
-    E --> G[(data/index/)]
-    F --> G
-    D1 --> H[(chunk metadata)]
-    H --> G
+    D1 --> D3[indexing.repo<br/>collect_repo_chunks: loop over RepoStats]
+    D3 --> E[indexing.vector<br/>embed_chunks -> build_index<br/>all-MiniLM-L6-v2, batched + L2-normalized]
+    D3 --> F[indexing.bm25<br/>rank-bm25 -- Day 05, not implemented yet]
+    E --> G[("data/index/<br/>vector.faiss + vector_metadata.json")]
+    F -.-> G
 ```
 
 `parse_file`/`chunk_file` are exercised directly by
-`tests/test_parser.py`/`tests/test_chunker.py` and a manual smoke test
-today — the `E`/`F`/`G` boxes above (embedding, BM25, persisted indexes)
-remain aspirational until Day 04/05 land the repo-wide loop that actually
-calls them.
+`tests/test_parser.py`/`tests/test_chunker.py`. `indexing.repo.collect_repo_chunks`
+(`D3`) and `indexing.vector` (`E`/`G`) are implemented and tested as of
+Day 04 (`tests/test_indexing_repo.py`, `tests/test_indexing_vector.py`) —
+a fresh process can `load_index(index_dir=...)` against `G` and query it
+with no rebuild. `F` (BM25) remains a placeholder until Day 05.
 
 ---
 
@@ -169,9 +191,9 @@ populated local block does not silently override a paid provider.
 | ------------- | -------------------------------------- | ---------------- |
 | Raw source    | User's filesystem                      | User             |
 | Parsed AST    | Memory only during ingest              | `parser/`        |
-| Chunks        | Memory + serialized to `INDEX_DIR`     | `chunker/`       |
-| Vector index  | `INDEX_DIR/*.faiss`                    | `indexing/vector.py` |
-| BM25 index    | `INDEX_DIR/*.pkl`                      | `indexing/bm25.py`   |
+| Chunks        | Memory only (aggregated by `indexing.repo.collect_repo_chunks`) | `chunker/`, `indexing/repo.py` |
+| Vector index  | `INDEX_DIR/vector.faiss` + `INDEX_DIR/vector_metadata.json` | `indexing/vector.py` |
+| BM25 index    | `INDEX_DIR/*.pkl` (not implemented yet -- Day 05) | `indexing/bm25.py`   |
 | Logs          | stderr / `LOG_LEVEL`                   | `cli`, `mcp`     |
 | Caches        | `.cache/`, `.mypy_cache/`, `.ruff_cache/` (gitignored) | tooling  |
 
