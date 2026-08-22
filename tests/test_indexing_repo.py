@@ -1,11 +1,19 @@
-"""Tests for repo-wide chunk collection (indexing.repo.collect_repo_chunks)."""
+"""Tests for repo-wide chunk collection (indexing.repo.collect_repo_chunks)
+and single-pass dual-index orchestration (indexing.repo.build_all_indexes).
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
+
+import pytest
 
 from codebase_rag_mcp.chunker.chunker import chunk_file
-from codebase_rag_mcp.indexing.repo import collect_repo_chunks
+from codebase_rag_mcp.chunker.models import Chunk
+from codebase_rag_mcp.indexing import repo
+from codebase_rag_mcp.indexing.models import Bm25IndexStats, VectorIndexStats
+from codebase_rag_mcp.indexing.repo import build_all_indexes, collect_repo_chunks
 from codebase_rag_mcp.ingestion.scanner import scan
 from codebase_rag_mcp.parser.extractor import parse_file
 
@@ -101,3 +109,100 @@ def test_collect_repo_chunks_skips_excluded_files(tmp_path: Path) -> None:
 
     assert not result.read_failures
     assert {c.file for c in result.chunks} == {"a.py"}
+
+
+# --- build_all_indexes --------------------------------------------------------- #
+
+
+class _FakeStats:
+    """Stand-in for VectorIndexStats/Bm25IndexStats -- records the chunk
+    list it was called with, matching this repo's closure-capture mocking
+    style (no unittest.mock.Mock)."""
+
+    vector_calls: ClassVar[list[list[Chunk]]] = []
+    bm25_calls: ClassVar[list[list[Chunk]]] = []
+
+    @staticmethod
+    def fake_vector_build_index(chunks: list[Chunk], **kwargs: object) -> VectorIndexStats:
+        _FakeStats.vector_calls.append(list(chunks))
+        return VectorIndexStats(
+            chunks_requested=len(chunks),
+            chunks_embedded=len(chunks),
+            chunks_skipped=0,
+            embedding_dimension=3,
+            index_size=len(chunks),
+        )
+
+    @staticmethod
+    def fake_bm25_build_index(chunks: list[Chunk], **kwargs: object) -> Bm25IndexStats:
+        _FakeStats.bm25_calls.append(list(chunks))
+        return Bm25IndexStats(
+            chunks_requested=len(chunks),
+            chunks_indexed=len(chunks),
+            chunks_skipped=0,
+            vocabulary_size=1,
+            index_size=len(chunks),
+        )
+
+
+@pytest.fixture(autouse=True)
+def _reset_fake_stats() -> None:
+    _FakeStats.vector_calls = []
+    _FakeStats.bm25_calls = []
+
+
+def test_build_all_indexes_calls_collect_repo_chunks_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(tmp_path / "a.py", _PY_SOURCE)
+    _write(tmp_path / "b.py", _PY_SOURCE_2)
+
+    call_count: list[int] = []
+    real_collect_repo_chunks = repo.collect_repo_chunks
+
+    def spy(*args: object, **kwargs: object) -> object:
+        call_count.append(1)
+        return real_collect_repo_chunks(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "collect_repo_chunks", spy)
+    monkeypatch.setattr(repo.vector, "build_index", _FakeStats.fake_vector_build_index)
+    monkeypatch.setattr(repo.bm25, "build_index", _FakeStats.fake_bm25_build_index)
+
+    build_all_indexes(tmp_path, index_dir=tmp_path / "idx")
+
+    assert len(call_count) == 1
+
+
+def test_build_all_indexes_passes_the_same_chunk_list_to_both_builders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(tmp_path / "a.py", _PY_SOURCE)
+    _write(tmp_path / "b.py", _PY_SOURCE_2)
+
+    monkeypatch.setattr(repo.vector, "build_index", _FakeStats.fake_vector_build_index)
+    monkeypatch.setattr(repo.bm25, "build_index", _FakeStats.fake_bm25_build_index)
+
+    build_all_indexes(tmp_path, index_dir=tmp_path / "idx")
+
+    assert len(_FakeStats.vector_calls) == 1
+    assert len(_FakeStats.bm25_calls) == 1
+    vector_ids = [c.id for c in _FakeStats.vector_calls[0]]
+    bm25_ids = [c.id for c in _FakeStats.bm25_calls[0]]
+    assert vector_ids == bm25_ids
+    assert vector_ids  # non-empty -- both builders actually received chunks
+
+
+def test_build_all_indexes_returns_vector_and_bm25_stats_tuple(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(tmp_path / "a.py", _PY_SOURCE)
+    _write(tmp_path / "b.py", _PY_SOURCE_2)
+
+    monkeypatch.setattr(repo.vector, "build_index", _FakeStats.fake_vector_build_index)
+    monkeypatch.setattr(repo.bm25, "build_index", _FakeStats.fake_bm25_build_index)
+
+    vector_stats, bm25_stats = build_all_indexes(tmp_path, index_dir=tmp_path / "idx")
+
+    assert isinstance(vector_stats, VectorIndexStats)
+    assert isinstance(bm25_stats, Bm25IndexStats)
+    assert vector_stats.chunks_requested == bm25_stats.chunks_requested

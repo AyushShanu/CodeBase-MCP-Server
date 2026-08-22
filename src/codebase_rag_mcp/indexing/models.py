@@ -80,7 +80,38 @@ class VectorQueryResult(BaseModel):
     score: float
 
 
+class Bm25IndexStats(BaseModel):
+    """Counts returned from a `bm25.build_index` call, for CLI/logging visibility.
+
+    Mirrors `VectorIndexStats` field-for-field where BM25 has an analogous
+    concept: `vocabulary_size` (unique BM25 corpus terms) is BM25's analog of
+    `VectorIndexStats.embedding_dimension`, and `chunks_indexed` (not
+    `chunks_embedded` -- BM25 tokenizes, it doesn't embed) mirrors
+    `chunks_embedded`.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    chunks_requested: int
+    chunks_indexed: int
+    chunks_skipped: int
+    skipped: list[SkippedChunk] = Field(default_factory=list)
+    vocabulary_size: int
+    index_size: int
+
+
+class Bm25QueryResult(BaseModel):
+    """One ranked result from `Bm25Index.query`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    chunk: Chunk
+    score: float
+
+
 __all__ = [
+    "Bm25IndexStats",
+    "Bm25QueryResult",
     "FileReadFailure",
     "IndexedChunk",
     "RepoChunkCollection",

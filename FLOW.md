@@ -106,6 +106,17 @@ search — the same normalization path is reused at query time
 (`VectorIndex.query`) so build-side and query-side vectors are always
 comparable.
 
+BM25 indexing (`indexing/bm25.py:build_index`) takes the same aggregated
+`list[Chunk]` — via `indexing/repo.py:build_all_indexes`, which calls
+`collect_repo_chunks` exactly once and hands the identical chunk list to
+both `vector.build_index` and `bm25.build_index`, so the two indexes always
+share the same chunk set and `Chunk.id` values (D-020). Chunks are
+tokenized (lowercase, split on non-alphanumeric runs — one shared
+`tokenize` function, reused at query time) into a `rank_bm25.BM25Okapi`
+corpus and persisted as a pickle (`bm25.pkl`, since `BM25Okapi` has no
+native serialization) alongside a JSON chunk-metadata sidecar
+(`bm25_metadata.json`), mirroring the vector index's binary+JSON split.
+
 ```mermaid
 flowchart TD
     A[Target: https:// GitHub URL or local path] --> B1[ingestion.loader<br/>load_repo]
@@ -125,9 +136,9 @@ flowchart TD
     D2 -.-> D1
     D1 --> D3[indexing.repo<br/>collect_repo_chunks: loop over RepoStats]
     D3 --> E[indexing.vector<br/>embed_chunks -> build_index<br/>all-MiniLM-L6-v2, batched + L2-normalized]
-    D3 --> F[indexing.bm25<br/>rank-bm25 -- Day 05, not implemented yet]
+    D3 --> F[indexing.bm25<br/>tokenize -> BM25Okapi build_index]
     E --> G[("data/index/<br/>vector.faiss + vector_metadata.json")]
-    F -.-> G
+    F --> H[("data/index/<br/>bm25.pkl + bm25_metadata.json")]
 ```
 
 `parse_file`/`chunk_file` are exercised directly by
@@ -135,7 +146,10 @@ flowchart TD
 (`D3`) and `indexing.vector` (`E`/`G`) are implemented and tested as of
 Day 04 (`tests/test_indexing_repo.py`, `tests/test_indexing_vector.py`) —
 a fresh process can `load_index(index_dir=...)` against `G` and query it
-with no rebuild. `F` (BM25) remains a placeholder until Day 05.
+with no rebuild. `F`/`H` (BM25) are implemented and tested as of Day 05
+(`tests/test_indexing_bm25.py`), reached via
+`indexing.repo.build_all_indexes` which calls `collect_repo_chunks` exactly
+once and builds `E` and `F` from the identical chunk list (D-020).
 
 ---
 
@@ -150,15 +164,26 @@ sequenceDiagram
     participant L as LLM provider
 
     U->>M: tools/call { name: "ask", arguments: {query} }
-    M->>R: hybrid_search(query, top_k)
-    R-->>R: ANN over FAISS + BM25
-    R-->>M: candidates (chunks + scores)
+    M->>R: hybrid_search(query, top_k, candidate_pool_size)
+    R-->>R: bm25.load_index().query(query, top_k=candidate_pool_size)
+    R-->>R: vector.load_index().query(query, top_k=candidate_pool_size)
+    R-->>R: filter vector candidates to score > 0.0
+    R-->>R: _reciprocal_rank_fusion(bm25_results, vector_results, k=RRF_K)
+    R-->>M: top_k merged HybridQueryResult (chunk + score + per-side rank/score)
     M->>X: rerank(query, candidates)
     X-->>M: top_n chunks
     M->>L: chat(system, {query + cited chunks})
     L-->>M: answer + cited chunk IDs
     M-->>U: {answer, citations}
 ```
+
+`retrieval.hybrid.hybrid_search` (Day 05, `tests/test_retrieval_hybrid.py`)
+loads both indexes fresh per call (no caching yet — Day 08's MCP server
+owns index lifecycle once it exists) and raises `NoIndexAvailableError`
+only if *neither* index is built/loadable; a query against two built
+indexes that matches nothing returns `[]` rather than raising, so a
+downstream "not enough evidence" fallback (Day 07) can tell "nothing
+indexed" apart from "indexed, no evidence for this query."
 
 ---
 
@@ -193,7 +218,7 @@ populated local block does not silently override a paid provider.
 | Parsed AST    | Memory only during ingest              | `parser/`        |
 | Chunks        | Memory only (aggregated by `indexing.repo.collect_repo_chunks`) | `chunker/`, `indexing/repo.py` |
 | Vector index  | `INDEX_DIR/vector.faiss` + `INDEX_DIR/vector_metadata.json` | `indexing/vector.py` |
-| BM25 index    | `INDEX_DIR/*.pkl` (not implemented yet -- Day 05) | `indexing/bm25.py`   |
+| BM25 index    | `INDEX_DIR/bm25.pkl` + `INDEX_DIR/bm25_metadata.json` | `indexing/bm25.py`   |
 | Logs          | stderr / `LOG_LEVEL`                   | `cli`, `mcp`     |
 | Caches        | `.cache/`, `.mypy_cache/`, `.ruff_cache/` (gitignored) | tooling  |
 
