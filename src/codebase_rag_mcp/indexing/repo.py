@@ -12,8 +12,16 @@ from pathlib import Path
 
 from codebase_rag_mcp.chunker.chunker import chunk_file
 from codebase_rag_mcp.chunker.models import Chunk
-from codebase_rag_mcp.indexing.models import FileReadFailure, RepoChunkCollection
+from codebase_rag_mcp.config import EMBEDDING_BATCH_SIZE, EMBEDDING_MODEL_NAME, INDEX_DIR
+from codebase_rag_mcp.indexing import bm25, vector
+from codebase_rag_mcp.indexing.models import (
+    Bm25IndexStats,
+    FileReadFailure,
+    RepoChunkCollection,
+    VectorIndexStats,
+)
 from codebase_rag_mcp.ingestion.models import RepoStats
+from codebase_rag_mcp.ingestion.scanner import scan
 from codebase_rag_mcp.parser.exceptions import ParseError, UnsupportedLanguageError
 from codebase_rag_mcp.parser.extractor import parse_file
 
@@ -73,4 +81,32 @@ def collect_repo_chunks(root: Path, stats: RepoStats, *, repo: str = "") -> Repo
     return RepoChunkCollection(chunks=chunks, read_failures=failures)
 
 
-__all__ = ["collect_repo_chunks"]
+def build_all_indexes(
+    root: Path,
+    *,
+    index_dir: str | Path = INDEX_DIR,
+    vector_model_name: str = EMBEDDING_MODEL_NAME,
+    vector_batch_size: int = EMBEDDING_BATCH_SIZE,
+    repo: str = "",
+) -> tuple[VectorIndexStats, Bm25IndexStats]:
+    """Scan `root`, collect its chunks exactly once, build both the vector
+    and BM25 indexes from that single `list[Chunk]`.
+
+    This is the structural enforcement of "same chunk set, same `Chunk.id`
+    values on both indexes": `collect_repo_chunks` is called exactly once
+    here, so there is no path in this codebase where the two index builds
+    can independently observe a repo that changed between them.
+    """
+    file_stats = scan(root)
+    result = collect_repo_chunks(root, file_stats, repo=repo)
+    vector_stats = vector.build_index(
+        result.chunks,
+        index_dir=index_dir,
+        model_name=vector_model_name,
+        batch_size=vector_batch_size,
+    )
+    bm25_stats = bm25.build_index(result.chunks, index_dir=index_dir)
+    return vector_stats, bm25_stats
+
+
+__all__ = ["build_all_indexes", "collect_repo_chunks"]

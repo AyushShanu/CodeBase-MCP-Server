@@ -1,7 +1,20 @@
 """Retrieval: hybrid query routing across the dense and sparse indexes.
 
-Not implemented yet. Will implement query expansion, hybrid scoring,
-optional filters (path/language/symbol kind), and result merging.
+`hybrid_search` merges `indexing.bm25`'s `BM25Okapi` candidates and
+`indexing.vector`'s FAISS candidates via Reciprocal Rank Fusion into one
+ranked, transparently-scored `list[HybridQueryResult]`. See DECISIONS.md
+for the merge-strategy rationale (RRF vs. weighted-sum).
 """
 
-__all__: list[str] = []
+from __future__ import annotations
+
+from codebase_rag_mcp.retrieval.exceptions import NoIndexAvailableError, RetrievalError
+from codebase_rag_mcp.retrieval.hybrid import hybrid_search
+from codebase_rag_mcp.retrieval.models import HybridQueryResult
+
+__all__ = [
+    "HybridQueryResult",
+    "NoIndexAvailableError",
+    "RetrievalError",
+    "hybrid_search",
+]

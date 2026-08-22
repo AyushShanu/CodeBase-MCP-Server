@@ -469,3 +469,97 @@
   wanted, accepted as a reasonable trade-off to unblock a real, necessary
   dependency. Revisit if this ever causes 3.12-only syntax to land
   unintentionally in code meant to run on 3.11.
+
+---
+
+## D-020 · Hybrid retrieval: RRF merge, BM25 tokenization, pickle persistence, single-orchestration build (day-05-hybrid-retrieval)
+
+- **Date:** 2026-08-22
+- **Status:** Accepted
+- **Context:** D-004 accepted a hybrid dense+sparse design but explicitly
+  deferred the merge strategy to "when implementing `retrieval/`" — Day 05
+  wires `rank-bm25` into `indexing/bm25.py` (mirroring `indexing/vector.py`'s
+  build/persist/load/query shape) and merges its candidates with
+  `indexing/vector.py`'s FAISS candidates in the new `retrieval/hybrid.py`.
+  Several open questions had to be resolved to do this.
+- **Decision — merge strategy: Reciprocal Rank Fusion (RRF), `k = 60`,
+  1-indexed rank.** `score = sum(1 / (k + rank))` over whichever of
+  {BM25 results, vector results} a chunk appears in; `rank` is 1-indexed
+  (`enumerate(results, start=1)` — the top result in a list has `rank = 1`,
+  never `0`). Implemented in `retrieval/hybrid._reciprocal_rank_fusion`.
+  **Alternatives considered:** weighted-sum of normalized scores
+  (`score = α·vector_score + (1-α)·bm25_score`) — rejected because BM25
+  scores are unbounded/corpus-dependent while vector scores are bounded
+  cosine similarities in `[-1, 1]`; combining them this way requires
+  normalizing two incomparable scales and re-tuning `α` per corpus, whereas
+  RRF only needs each list's rank order, already well-defined on both
+  sides.
+- **Decision — BM25 tokenization: lowercase, split on
+  `[^a-zA-Z0-9]+`, no camelCase/snake_case sub-splitting.** Enforced in
+  exactly one function (`indexing.bm25.tokenize`), reached identically at
+  build time and query time — the same discipline D-016 applies to
+  `_l2_normalize`. **Named limitation:** `generateToken` stays one token
+  (camelCase is alnum-contiguous, nothing to split on), but
+  `generate_token` *does* split into `["generate", "token"]` (`_` is itself
+  non-alphanumeric) — so a query like `"generate token"` will not lexically
+  match `generateToken` via BM25 (it remains reachable via the vector side).
+  CamelCase/snake_case-aware sub-word splitting is a reasonable future
+  improvement (Day 09/11 polish), not silently out of scope.
+- **Decision — BM25 persistence: pickle for the BM25 state, JSON for chunk
+  metadata.** `BM25Okapi` has no native serialization format, so
+  `indexing.bm25.build_index` pickles `{"tokenized_corpus": ...,
+  "bm25": BM25Okapi(...)}` to `bm25.pkl`, keeping chunk metadata in a
+  separate `bm25_metadata.json` sidecar — mirrors `indexing/vector.py`'s
+  FAISS-binary/JSON-metadata split (D-015) and narrows the pickle's blast
+  radius to exactly what has no JSON-native serialization. **Only ever
+  unpickle a file this process itself wrote to `index_dir`; never unpickle
+  index data from an untrusted or externally-supplied path** — pickle
+  deserialization of arbitrary input is a known code-execution risk (same
+  untrusted-input discipline D-009 applied to cloned repo content).
+- **Decision — `indexing.repo.build_all_indexes` as the single
+  chunk-collection entry point.** Calls `collect_repo_chunks` exactly once,
+  then builds both the vector and BM25 indexes from that one `list[Chunk]`
+  — structurally enforces "same chunk set, same `Chunk.id` values on both
+  indexes" rather than relying on convention; there is no code path where
+  the two index builds can independently observe a repo that changed
+  between them.
+- **Decision — vector-side `score > 0.0` floor applied inside
+  `retrieval/hybrid.py`, not `indexing/vector.py`.** The spec's own
+  Definition of Done has two claims in tension: an empty/nonsensical query
+  "may return a low-relevance result," while a query with no real match
+  anywhere must return an *explicitly empty* list. `VectorIndex.query`
+  (Day 04, unchanged) never thresholds by design — it always returns up to
+  `top_k` neighbours regardless of relevance. `hybrid_search` filters
+  vector candidates to `score > 0.0` before RRF, mirroring the floor
+  `Bm25Index.query` already applies internally (`score <= 0` excluded) —
+  this satisfies both DoD claims without touching Day 04's established
+  `VectorIndex` contract.
+- **Observation — BM25 query latency:** `rank_bm25.BM25Okapi.get_scores` is
+  a linear scan over the whole corpus with no inverted index. Measured
+  against a real clone of `sindresorhus/p-queue` (78 indexed chunks, 1215
+  vocabulary terms): a single `Bm25Index.query(...)` call took ~0.045 ms —
+  effectively instant at this scale. Revisit only if a much larger target
+  corpus (many tens of thousands of chunks) makes this measurably show up
+  in Day 07's per-question latency.
+- **Observation — real-repo smoke test quality:** both an exact-symbol
+  query (`"PQueue"`) and a natural-language query (`"where do we limit
+  concurrent operations"`) against the real `p-queue` clone returned
+  genuinely real code with correct file/symbol/line citations in the
+  merged top-5. Ranking quality at this stage is rougher than ideal — BM25
+  favors whichever chunk mentions the query term most densely (e.g. a test
+  file over the actual class definition), and the vector side's generic
+  `all-MiniLM-L6-v2` embeddings aren't code-specialized — but this is
+  expected and acceptable for Day 05: Day 06 (reranking) is explicitly
+  where retrieval quality gets refined further, and this day's job was
+  correct hybrid merging with transparent scoring, not final ranking
+  quality.
+- **Consequences:** `retrieval.hybrid_search` raises `NoIndexAvailableError`
+  only when *neither* index is built/loadable under `index_dir`; a query
+  against two genuinely built indexes that matches nothing returns `[]`
+  rather than raising, so Day 07's "not enough evidence" fallback can tell
+  the two cases apart. BM25-specific exceptions (`Bm25NotBuiltError`,
+  `Bm25LoadError`, `EmptyBm25IndexError`) are distinct from the
+  vector-flavored ones already in `indexing/exceptions.py`, since
+  `indexing/` is now the one stage running two index technologies
+  concurrently and reusing the vector names would make
+  `except IndexLoadError` ambiguous about which subsystem failed.

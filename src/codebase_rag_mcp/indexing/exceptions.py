@@ -28,8 +28,24 @@ class IndexLoadError(IndexingError):
     """Raised when a persisted index/metadata file exists but is unreadable or inconsistent."""
 
 
+class Bm25NotBuiltError(IndexingError):
+    """Raised by `bm25.load_index` when `index_dir` has no persisted BM25 index files yet."""
+
+
+class Bm25LoadError(IndexingError):
+    """Raised when a persisted BM25 index/metadata file exists but is unreadable,
+    unpicklable, or inconsistent."""
+
+
+class EmptyBm25IndexError(IndexingError):
+    """Raised when a build or load would leave a queryable BM25 index with zero documents."""
+
+
 __all__ = [
+    "Bm25LoadError",
+    "Bm25NotBuiltError",
     "EmbeddingModelError",
+    "EmptyBm25IndexError",
     "EmptyIndexError",
     "IndexLoadError",
     "IndexNotBuiltError",

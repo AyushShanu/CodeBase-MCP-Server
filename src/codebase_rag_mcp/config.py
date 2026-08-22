@@ -55,6 +55,12 @@ EMBEDDING_MODEL_NAME: Final[str] = _getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L
 EMBEDDING_BATCH_SIZE: Final[int] = _getenv_int("EMBEDDING_BATCH_SIZE", 32)
 
 
+# --- Retrieval settings ----------------------------------------------------- #
+
+RRF_K: Final[int] = _getenv_int("RRF_K", 60)
+HYBRID_CANDIDATE_POOL_SIZE: Final[int] = _getenv_int("HYBRID_CANDIDATE_POOL_SIZE", 50)
+
+
 # --- Runtime configuration ------------------------------------------------- #
 
 LOG_LEVEL: Final[str] = _getenv("LOG_LEVEL", "INFO")
@@ -87,6 +93,7 @@ __all__ = [
     "EMBEDDING_MODEL_NAME",
     "GEMINI_API_KEY",
     "GROQ_API_KEY",
+    "HYBRID_CANDIDATE_POOL_SIZE",
     "INDEX_DIR",
     "LOCAL_MODEL_API_KEY",
     "LOCAL_MODEL_BASE_URL",
@@ -94,6 +101,7 @@ __all__ = [
     "LOG_LEVEL",
     "NVIDIA_API_KEY",
     "OPENROUTER_API_KEY",
+    "RRF_K",
     "ProviderKeys",
     "provider_keys",
 ]
