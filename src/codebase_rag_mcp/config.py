@@ -61,6 +61,15 @@ RRF_K: Final[int] = _getenv_int("RRF_K", 60)
 HYBRID_CANDIDATE_POOL_SIZE: Final[int] = _getenv_int("HYBRID_CANDIDATE_POOL_SIZE", 50)
 
 
+# --- Reranker settings ------------------------------------------------------ #
+
+RERANKER_MODEL_NAME: Final[str] = _getenv(
+    "RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+)
+RERANKER_MAX_LENGTH: Final[int] = _getenv_int("RERANKER_MAX_LENGTH", 512)
+RERANK_TOP_N: Final[int] = _getenv_int("RERANK_TOP_N", 8)
+
+
 # --- Runtime configuration ------------------------------------------------- #
 
 LOG_LEVEL: Final[str] = _getenv("LOG_LEVEL", "INFO")
@@ -101,6 +110,9 @@ __all__ = [
     "LOG_LEVEL",
     "NVIDIA_API_KEY",
     "OPENROUTER_API_KEY",
+    "RERANKER_MAX_LENGTH",
+    "RERANKER_MODEL_NAME",
+    "RERANK_TOP_N",
     "RRF_K",
     "ProviderKeys",
     "provider_keys",

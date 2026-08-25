@@ -1,0 +1,114 @@
+[
+  {
+    "id": "q01",
+    "question": "What does the `PQueue` class do?",
+    "category": "exact_symbol",
+    "expected_file": "source/index.ts",
+    "expected_symbol": "PQueue",
+    "notes": "The package's default-exported main class -- a promise queue with concurrency control."
+  },
+  {
+    "id": "q02",
+    "question": "Where is `PriorityQueue` defined?",
+    "category": "exact_symbol",
+    "expected_file": "source/priority-queue.ts",
+    "expected_symbol": "PriorityQueue",
+    "notes": "Default export of priority-queue.ts; implements the `Queue` interface from queue.ts."
+  },
+  {
+    "id": "q03",
+    "question": "What does the `lowerBound` function do?",
+    "category": "exact_symbol",
+    "expected_file": "source/lower-bound.ts",
+    "expected_symbol": "lowerBound",
+    "notes": "Binary-search helper used by PriorityQueue to insert tasks in priority order."
+  },
+  {
+    "id": "q04",
+    "question": "What options does `QueueAddOptions` support?",
+    "category": "exact_symbol",
+    "expected_file": "source/options.ts",
+    "expected_symbol": "QueueAddOptions",
+    "notes": "Type declared at source/options.ts:97."
+  },
+  {
+    "id": "q05",
+    "question": "Where is the `Queue` type declared?",
+    "category": "exact_symbol",
+    "expected_file": "source/queue.ts",
+    "expected_symbol": "Queue",
+    "notes": "The generic queue interface `PriorityQueue` implements; re-exported from source/index.ts."
+  },
+  {
+    "id": "q06",
+    "question": "Where do we limit concurrent operations?",
+    "category": "semantic",
+    "expected_file": "source/index.ts",
+    "expected_symbol": null,
+    "notes": "PQueue's `#concurrency` field and `concurrency` getter/setter (source/index.ts:379-388); no shared lexical overlap with the question wording, so BM25 alone ranks this poorly -- exercises the vector/rerank side."
+  },
+  {
+    "id": "q07",
+    "question": "How does pausing the queue work?",
+    "category": "semantic",
+    "expected_file": "source/index.ts",
+    "expected_symbol": "PQueue.pause",
+    "notes": "`pause()` method at source/index.ts:608."
+  },
+  {
+    "id": "q08",
+    "question": "How are queued tasks prioritized?",
+    "category": "semantic",
+    "expected_file": "source/priority-queue.ts",
+    "expected_symbol": null,
+    "notes": "Priority ordering is implemented via lowerBound-based insertion in PriorityQueue's enqueue/dequeue methods."
+  },
+  {
+    "id": "q09",
+    "question": "How does the queue handle task timeouts?",
+    "category": "semantic",
+    "expected_file": "source/index.ts",
+    "expected_symbol": null,
+    "notes": "Uses the `p-timeout` package; `timeout` option handling starts around source/index.ts:66-130."
+  },
+  {
+    "id": "q10",
+    "question": "How can I wait for the queue to become idle?",
+    "category": "semantic",
+    "expected_file": "source/index.ts",
+    "expected_symbol": "PQueue.onIdle",
+    "notes": "`onIdle()` method at source/index.ts:684; distinct from the lower-guarantee `onEmpty()`."
+  },
+  {
+    "id": "q11",
+    "question": "What does the main module export?",
+    "category": "structural",
+    "expected_file": "source/index.ts",
+    "expected_symbol": null,
+    "notes": "Default-exports `PQueue`; also re-exports the `Queue` type from queue.ts."
+  },
+  {
+    "id": "q12",
+    "question": "Which file defines the queue's option types?",
+    "category": "structural",
+    "expected_file": "source/options.ts",
+    "expected_symbol": null,
+    "notes": "Declares `Options`, `QueueAddOptions`, `TaskOptions`."
+  },
+  {
+    "id": "q13",
+    "question": "What test coverage exists for priority ordering?",
+    "category": "structural",
+    "expected_file": "test/priority-queue.ts",
+    "expected_symbol": null,
+    "notes": "Dedicated test file for PriorityQueue behavior, separate from test/basic.ts."
+  },
+  {
+    "id": "q14",
+    "question": "What TypeScript types does this package export for consumers to use?",
+    "category": "structural",
+    "expected_file": "source/queue.ts",
+    "expected_symbol": null,
+    "notes": "`RunFunction` and `Queue` types declared here; re-exported from source/index.ts."
+  }
+]

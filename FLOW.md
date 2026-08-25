@@ -164,14 +164,16 @@ sequenceDiagram
     participant L as LLM provider
 
     U->>M: tools/call { name: "ask", arguments: {query} }
-    M->>R: hybrid_search(query, top_k, candidate_pool_size)
+    M->>R: hybrid_search(query, top_k=HYBRID_CANDIDATE_POOL_SIZE, candidate_pool_size)
     R-->>R: bm25.load_index().query(query, top_k=candidate_pool_size)
     R-->>R: vector.load_index().query(query, top_k=candidate_pool_size)
     R-->>R: filter vector candidates to score > 0.0
     R-->>R: _reciprocal_rank_fusion(bm25_results, vector_results, k=RRF_K)
-    R-->>M: top_k merged HybridQueryResult (chunk + score + per-side rank/score)
-    M->>X: rerank(query, candidates)
-    X-->>M: top_n chunks
+    R-->>M: wide pool (up to HYBRID_CANDIDATE_POOL_SIZE) HybridQueryResult -- NOT the narrow default top_k=10
+    M->>X: reranker.rerank.rerank(query, candidates, top_n=RERANK_TOP_N)
+    X-->>X: CrossEncoder(RERANKER_MODEL_NAME, max_length=RERANKER_MAX_LENGTH).predict([(query, c.chunk.content) for c in candidates])
+    X-->>X: sort by rerank_score desc, take top_n (rerank_score and RRF score never combined)
+    X-->>M: top_n RerankedResult, each wrapping its full HybridQueryResult
     M->>L: chat(system, {query + cited chunks})
     L-->>M: answer + cited chunk IDs
     M-->>U: {answer, citations}
@@ -184,6 +186,22 @@ only if *neither* index is built/loadable; a query against two built
 indexes that matches nothing returns `[]` rather than raising, so a
 downstream "not enough evidence" fallback (Day 07) can tell "nothing
 indexed" apart from "indexed, no evidence for this query."
+
+`reranker.rerank.rerank` (Day 06, `tests/test_reranker.py`) consumes
+`hybrid_search`'s output as-is — it never re-embeds, re-tokenizes, or
+re-fetches chunk content, only reorders the `HybridQueryResult`s it is
+given. **Callers must pass `top_k=HYBRID_CANDIDATE_POOL_SIZE` into
+`hybrid_search` before reranking** — the default `top_k=10` truncates the
+merged pool before the reranker ever sees it, defeating the point of this
+stage; this is the explicit interface contract between Day 05 and Day 06
+(see DECISIONS.md D-021). `rerank_score` (a raw cross-encoder logit) and
+the RRF `score` on the wrapped `HybridQueryResult` are never combined into
+a single number — only `rerank_score` determines the reordered output.
+Like `hybrid_search`, `rerank` loads a fresh `CrossEncoder` instance per
+call (no caching yet); D-021 measured this construction cost at ~9.7-9.9 s
+against ~304 ms for the batched scoring pass itself over a 50-candidate
+pool — construction, not inference, dominates this stage's latency, which
+is the strongest argument yet for Day 08 to own model lifecycle/caching.
 
 ---
 
