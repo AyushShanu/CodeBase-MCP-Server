@@ -132,7 +132,16 @@ def hybrid_search(
         )
 
     merged = _reciprocal_rank_fusion(bm25_results, vector_results, k=rrf_k)
-    return merged[:top_k]
+    top = merged[:top_k]
+    logger.info(
+        "hybrid_search under %s: bm25_candidates=%d vector_candidates=%d merged=%d returned=%d",
+        index_dir,
+        len(bm25_results),
+        len(vector_results),
+        len(merged),
+        len(top),
+    )
+    return top
 
 
 __all__ = ["hybrid_search"]

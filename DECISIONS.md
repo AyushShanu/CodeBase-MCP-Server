@@ -563,3 +563,101 @@
   `indexing/` is now the one stage running two index technologies
   concurrently and reusing the vector names would make
   `except IndexLoadError` ambiguous about which subsystem failed.
+
+---
+
+## D-021 · Cross-encoder reranking: model choice, score-scale non-combination, explicit max_length, hybrid_search wide-top_k calling contract (day-06-reranker)
+
+- **Date:** 2026-08-25
+- **Status:** Accepted
+- **Context:** Day 05 gave the pipeline `retrieval.hybrid.hybrid_search`,
+  whose RRF fusion score is a rank-order heuristic that never looks at the
+  query and a chunk together (D-020's own "real-repo smoke test quality"
+  observation named Day 06 as where retrieval quality gets refined
+  further). CLAUDE.md's Day 06 line calls for a cross-encoder to rerank a
+  *larger* hybrid candidate pool down to the strongest context. Several
+  decisions had to be made and logged.
+- **Decision — model: `cross-encoder/ms-marco-MiniLM-L-6-v2`.** CLAUDE.md's
+  own "start here" default for the Reranker stack-table row; small
+  (~80MB), well-established MS MARCO-trained, fast CPU inference for the
+  scoring pass itself (see the measured latency below). **Alternatives
+  considered (documented, not built):** `bge-reranker-base` (larger,
+  generally stronger multilingual relevance, higher latency);
+  `mxbai-rerank-base-v1` (newer, competitive quality, less battle-tested at
+  this project's scale). Both swappable later purely via
+  `RERANKER_MODEL_NAME` — no code change, since `CrossEncoder(model_name)`
+  is the only place the name is consumed.
+- **Decision — no new dependency.** `sentence-transformers>=3.0` (declared
+  in `pyproject.toml` at Day 01 scaffolding, already used transitively via
+  `langchain-huggingface`) already provides
+  `sentence_transformers.CrossEncoder` — no `pyproject.toml` change.
+- **Decision — score scale: `rerank_score` and `HybridQueryResult.score`
+  (RRF) are never combined, averaged, or renormalized.** `CrossEncoder
+  .predict()` returns a raw, unbounded relevance logit, not comparable to
+  RRF's `1 / (k + rank)` fusion score. `rerank_score` alone determines
+  reranked order; both scores stay visible on `RerankedResult` for
+  transparency. Mirrors D-020's own RRF-over-weighted-sum reasoning (avoid
+  combining two incomparable scales), applied one stage further
+  downstream. Implemented in `reranker.rerank.rerank`; enforced by never
+  introducing a combined field on `reranker.models.RerankedResult`.
+- **Decision — explicit `RERANKER_MAX_LENGTH=512`, passed directly to
+  `CrossEncoder(model_name, max_length=...)`.** `ms-marco-MiniLM-L-6-v2`
+  defaults to a 512-token combined `(query, passage)` sequence length; a
+  large chunk (a big function/class body from Day 03's chunking) can
+  exceed that. Making the truncation point an explicit, stated value
+  rather than an implicit library default that could silently change on a
+  version bump. **Accepted limitation:** long chunks are truncated from the
+  tail with no chunk-splitting/summarization workaround — code chunks
+  typically carry their identifying signature near the top, so this is a
+  reasonable tradeoff for this day, the same discipline D-020 applied to
+  BM25's camelCase/snake_case tokenization limitation.
+- **Decision — no cross-call caching.** `rerank` loads a fresh
+  `CrossEncoder` instance per call, the same convention
+  `indexing.vector.embed_texts` and `retrieval.hybrid.hybrid_search`
+  already use. Day 08's MCP server owns model/index lifecycle once it
+  exists; this day does not introduce caching the rest of the codebase
+  doesn't have yet. **This is not free — see the measured construction
+  latency below, which makes caching a clear priority for Day 08.**
+- **Decision — calling contract with `hybrid_search`: any caller intending
+  to rerank MUST call `hybrid_search(query,
+  top_k=HYBRID_CANDIDATE_POOL_SIZE, ...)`, never rely on `hybrid_search`'s
+  own default `top_k=10`.** `hybrid_search`'s default truncates the merged
+  RRF list *before* reranking ever sees it, defeating the entire purpose of
+  this stage ("reranks a *larger* hybrid candidate pool" — CLAUDE.md).
+  Exercised directly in
+  `tests/test_reranker.py::test_hybrid_search_wide_top_k_then_rerank_surfaces_candidate_default_top_k_would_cut_off`
+  and visible in `FLOW.md` Section 3's sequence diagram. Must be repeated
+  in Day 08's spec when `search_code` wires the two functions together.
+- **Observation — reranker latency against the real `p-queue` clone (78
+  indexed chunks, same clone D-020 measured):** `CrossEncoder(
+  "cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)` construction
+  took **~9.7-9.9 s**, measured consistently across repeated calls in both
+  a fresh process and the same process (not a one-time download cost —
+  every single call pays this). A single batched `.predict()` call over a
+  `HYBRID_CANDIDATE_POOL_SIZE=50`-candidate pool took **~304 ms**.
+  Construction cost is roughly **30x** the batched inference cost — the
+  clear latency bottleneck of this stage, and strong evidence that Day
+  08's MCP server should cache the `CrossEncoder` instance across queries
+  rather than reconstruct it per call (the same way it will need to own
+  index lifecycle for `indexing.vector`/`indexing.bm25`). Revisit this
+  day's "no caching" decision at that point.
+- **Observation — retrieval quality improvement:** for the semantic query
+  `"how can I wait for the queue to become idle"`, the top hybrid-only
+  (RRF, default `top_k`) result was `PQueue.#tryToStartAnother`
+  (source/index.ts:280-329, an internal scheduling method unrelated to
+  waiting/idling); after reranking a `top_k=HYBRID_CANDIDATE_POOL_SIZE`
+  hybrid pool, the top result became the chunk at source/index.ts:616-715
+  (covering `pause()`/`onIdle()`), a genuinely more relevant match for the
+  question. For the exact-symbol query `"lowerBound"`, both hybrid-only and
+  reranked top results agreed on the correct `lowerBound`
+  (source/lower-bound.ts:3-20) chunk, confirming reranking does not
+  regress an already-correct exact-match case.
+- **Consequences:** `reranker.rerank.rerank` never re-embeds, re-tokenizes,
+  or re-fetches chunk content — it consumes `HybridQueryResult.chunk
+  .content` directly. `RerankedResult` (frozen Pydantic,
+  `reranker/models.py`) nests the full `HybridQueryResult` under
+  `hybrid_result` rather than flattening it, mirroring `HybridQueryResult`'s
+  own nesting of `Chunk`. `benchmarks/questions.json` (14 questions —
+  5 `exact_symbol`, 5 `semantic`, 4 `structural`) is committed as a tracked
+  source file against the real `p-queue` clone and doubles as Day 11's V2
+  eval set.
