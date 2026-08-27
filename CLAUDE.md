@@ -50,6 +50,7 @@ LLM generation always goes through the fallback chain (NVIDIA NIM → Groq → O
 | `search_code` | Hybrid retrieval search, returns ranked code evidence | V1 |
 | `find_symbol` | Find a function/class/method/interface and its definition/usages | V1 |
 | `get_file_context` | Return an exact file/line range for additional context | V1 |
+| `ask` | Full RAG pipeline: retrieve, rerank, and generate a citation-backed answer | V1 |
 | `analyze_impact` | Find references/callers/imports/tests, explain likely change impact | V2 |
 | `repository_summary` | Summarize repository structure, major modules, relationships | V2 |
 

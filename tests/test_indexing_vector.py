@@ -85,6 +85,17 @@ def test_embed_texts_passes_batch_size_to_encode_kwargs() -> None:
     assert _FakeEmbeddings.instances[0]["encode_kwargs"]["batch_size"] == 7  # type: ignore[index]
 
 
+def test_embed_texts_uses_given_embeddings_instead_of_constructing_one() -> None:
+    preloaded = _FakeEmbeddings(model_name="preloaded")
+    _FakeEmbeddings.instances = []  # discard the construction just above
+
+    vectors = embed_texts(["a", "b"], embeddings=preloaded)
+
+    assert _FakeEmbeddings.instances == []
+    assert len(_FakeEmbeddings.calls) == 1
+    assert vectors.shape[0] == 2
+
+
 def test_embed_texts_vectors_are_l2_normalized() -> None:
     vectors = embed_texts(["short", "a much much longer piece of text than the other"])
 
@@ -248,6 +259,27 @@ def test_vector_index_query_empty_string_does_not_crash(tmp_path: Path) -> None:
 
     assert isinstance(loaded.query(""), list)
     assert isinstance(loaded.query("!!!???"), list)
+
+
+def test_vector_index_query_uses_given_embeddings_instead_of_constructing_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chunks = [_chunk("a", "alpha"), _chunk("b", "beta text")]
+    index_dir = tmp_path / "idx"
+    build_index(chunks, index_dir=index_dir)
+    loaded = load_index(index_dir=index_dir)
+    preloaded = _FakeEmbeddings(model_name="preloaded")
+    _FakeEmbeddings.instances = []  # discard the construction just above
+
+    def _fail_if_constructed(*args: object, **kwargs: object) -> None:
+        raise AssertionError("HuggingFaceEmbeddings must not be constructed when given")
+
+    monkeypatch.setattr(vector, "HuggingFaceEmbeddings", _fail_if_constructed)
+
+    results = loaded.query("alpha", top_k=2, embeddings=preloaded)
+
+    assert results
+    assert _FakeEmbeddings.instances == []
 
 
 # --- Real-model tests (opt-in, skipped by default) ---------------------------- #

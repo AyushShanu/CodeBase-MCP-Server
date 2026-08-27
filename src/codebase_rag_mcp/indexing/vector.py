@@ -52,14 +52,23 @@ def embed_texts(
     *,
     model_name: str = EMBEDDING_MODEL_NAME,
     batch_size: int = EMBEDDING_BATCH_SIZE,
+    embeddings: HuggingFaceEmbeddings | None = None,
 ) -> np.ndarray:
     """Embed `texts`, returning an (n, dim) float32 array whose rows are
     all L2-normalized (norm ~= 1.0).
 
-    Loads a fresh `HuggingFaceEmbeddings(model_name=...)` per call (not
-    cached across calls -- a `functools.cache`d singleton would leak a
-    stale instance across tests that monkeypatch this class) and calls
-    `embed_documents` once with the full text list, letting
+    Loads a fresh `HuggingFaceEmbeddings(model_name=...)` per call by
+    default (not cached across calls -- a `functools.cache`d singleton
+    would leak a stale instance across tests that monkeypatch this class).
+    Pass an already-constructed `embeddings` to reuse it instead --
+    `embed_texts` then skips construction entirely. Omitting it (the
+    default, `None`) is byte-for-byte identical to every prior day's
+    behavior. Day 08's MCP server passes its startup-cached instance into
+    `VectorIndex.query`'s own `embeddings` parameter so a query-time
+    HuggingFace Hub "is this model current" network round-trip never
+    happens per query (see DECISIONS.md D-023).
+
+    Calls `embed_documents` once with the full text list, letting
     `sentence-transformers`' own `encode(..., batch_size=...)` do the
     internal batching -- never one call per text. `normalize_embeddings=True`
     is also requested via `encode_kwargs` for the real model's own
@@ -68,13 +77,18 @@ def embed_texts(
 
     Raises `EmbeddingModelError` if the model fails to load or embed.
     """
-    try:
-        embedder = HuggingFaceEmbeddings(
-            model_name=model_name,
-            encode_kwargs={"normalize_embeddings": True, "batch_size": batch_size},
-        )
-    except Exception as exc:
-        raise EmbeddingModelError(f"failed to load embedding model {model_name!r}: {exc}") from exc
+    if embeddings is not None:
+        embedder = embeddings
+    else:
+        try:
+            embedder = HuggingFaceEmbeddings(
+                model_name=model_name,
+                encode_kwargs={"normalize_embeddings": True, "batch_size": batch_size},
+            )
+        except Exception as exc:
+            raise EmbeddingModelError(
+                f"failed to load embedding model {model_name!r}: {exc}"
+            ) from exc
 
     try:
         vectors = embedder.embed_documents(texts)
@@ -203,16 +217,28 @@ class VectorIndex:
     def indexed_chunks(self) -> list[IndexedChunk]:
         return [IndexedChunk(chunk=c, vector_id=i) for i, c in enumerate(self._chunks)]
 
-    def query(self, text: str, *, top_k: int = 10) -> list[VectorQueryResult]:
+    def query(
+        self,
+        text: str,
+        *,
+        top_k: int = 10,
+        embeddings: HuggingFaceEmbeddings | None = None,
+    ) -> list[VectorQueryResult]:
         """Embed `text` through the exact same `embed_texts` path used at
         build time (so the query vector is L2-normalized identically to
         every indexed vector) and return up to `top_k` nearest chunks by
         cosine similarity (highest score first).
 
+        Pass an already-constructed `embeddings` (see `embed_texts`) to
+        reuse it instead of constructing a fresh one for this query --
+        purely additive; omitting it preserves today's exact behavior.
+
         Never raises for an empty or nonsensical `text` -- it still embeds
         to a well-defined (if low-relevance) vector and searches normally.
         """
-        query_vector = embed_texts([text], model_name=self._model_name, batch_size=1)
+        query_vector = embed_texts(
+            [text], model_name=self._model_name, batch_size=1, embeddings=embeddings
+        )
         k = min(top_k, self._index.ntotal)
         scores, ids = self._index.search(query_vector, k)
         results: list[VectorQueryResult] = []

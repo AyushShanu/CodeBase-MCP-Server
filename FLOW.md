@@ -15,7 +15,7 @@ flowchart LR
 
     subgraph Server[codebase-rag-mcp server]
         MCP[MCP stdio layer<br/>mcp/server.py]
-        TOOLS[Tool handlers<br/>search · impact · ask]
+        TOOLS[Tool handlers<br/>search_code · find_symbol · get_file_context · ask]
         RETRIEVAL[Retrieval]
         RERANKER[Reranker]
         GEN[Generation]
@@ -153,7 +153,17 @@ once and builds `E` and `F` from the identical chunk list (D-020).
 
 ---
 
-## 3. Online query flow (`ask` tool)
+## 3. Online query flow
+
+The MCP server (`mcp/server.py`, Day 08) owns four tools. `search_code`,
+`find_symbol`, and `get_file_context` return raw evidence; only `ask` calls
+`generate_answer`. All four read cached state (`vector_index`, `bm25_index`,
+one `CrossEncoder`, one embedding-model instance) loaded/constructed exactly
+once at server startup via `lifespan` — see D-023 — never reconstructed
+per call, and never touched without holding `_ServerState.lock` for the
+two calls that actually use it (`hybrid_search`/`rerank`).
+
+**`ask` tool:**
 
 ```mermaid
 sequenceDiagram
@@ -166,16 +176,17 @@ sequenceDiagram
     participant C as Citations
 
     U->>M: tools/call { name: "ask", arguments: {query} }
-    M->>R: hybrid_search(query, top_k=HYBRID_CANDIDATE_POOL_SIZE, candidate_pool_size)
-    R-->>R: bm25.load_index().query(query, top_k=candidate_pool_size)
-    R-->>R: vector.load_index().query(query, top_k=candidate_pool_size)
+    M->>R: hybrid_search(query, top_k=HYBRID_CANDIDATE_POOL_SIZE, vector_index=state.vector_index, bm25_index=state.bm25_index, embeddings=state.embeddings)
+    R-->>R: state.bm25_index.query(query, top_k=candidate_pool_size) -- no bm25.load_index() call, index already cached
+    R-->>R: state.vector_index.query(query, top_k=candidate_pool_size, embeddings=state.embeddings) -- no vector.load_index()/HuggingFaceEmbeddings() call either
     R-->>R: filter vector candidates to score > 0.0
     R-->>R: _reciprocal_rank_fusion(bm25_results, vector_results, k=RRF_K)
     R-->>M: wide pool (up to HYBRID_CANDIDATE_POOL_SIZE) HybridQueryResult -- NOT the narrow default top_k=10
-    M->>X: reranker.rerank.rerank(query, candidates, top_n=RERANK_TOP_N)
-    X-->>X: CrossEncoder(RERANKER_MODEL_NAME, max_length=RERANKER_MAX_LENGTH).predict([(query, c.chunk.content) for c in candidates])
+    M->>X: reranker.rerank.rerank(query, candidates, cross_encoder=state.cross_encoder)
+    X-->>X: state.cross_encoder.predict([(query, c.chunk.content) for c in candidates]) -- no CrossEncoder(...) construction
     X-->>X: sort by rerank_score desc, take top_n (rerank_score and RRF score never combined)
     X-->>M: top_n RerankedResult, each wrapping its full HybridQueryResult
+    Note over M: state.lock released here -- generate_answer runs outside it (network call, not shared local-model state)
     M->>G: generate_answer(query, candidates)
     alt candidates is empty
         G-->>M: GeneratedAnswer(insufficient evidence, provider_used=None) -- no provider ever called
@@ -205,10 +216,14 @@ sequenceDiagram
 ```
 
 `retrieval.hybrid.hybrid_search` (Day 05, `tests/test_retrieval_hybrid.py`)
-loads both indexes fresh per call (no caching yet — Day 08's MCP server
-owns index lifecycle once it exists) and raises `NoIndexAvailableError`
-only if *neither* index is built/loadable; a query against two built
-indexes that matches nothing returns `[]` rather than raising, so a
+loads both indexes fresh each call *unless* a caller passes already-loaded
+`vector_index`/`bm25_index`/`embeddings` instances (Day 08's additive
+caching parameters, D-023) — `mcp/server.py` is the first real caller to do
+so, using its startup-cached instances so no per-query `load_index`/
+`HuggingFaceEmbeddings()` call (and the network round-trip the latter was
+found to trigger) ever happens. Raises `NoIndexAvailableError` only if
+*neither* index is available (given or loadable); a query against two
+built indexes that matches nothing returns `[]` rather than raising, so a
 downstream "not enough evidence" fallback (Day 07) can tell "nothing
 indexed" apart from "indexed, no evidence for this query."
 
@@ -219,19 +234,20 @@ given. **Callers must pass `top_k=HYBRID_CANDIDATE_POOL_SIZE` into
 `hybrid_search` before reranking** — the default `top_k=10` truncates the
 merged pool before the reranker ever sees it, defeating the point of this
 stage; this is the explicit interface contract between Day 05 and Day 06
-(see DECISIONS.md D-021). `rerank_score` (a raw cross-encoder logit) and
-the RRF `score` on the wrapped `HybridQueryResult` are never combined into
-a single number — only `rerank_score` determines the reordered output.
-Like `hybrid_search`, `rerank` loads a fresh `CrossEncoder` instance per
-call (no caching yet); D-021 measured this construction cost at ~9.7-9.9 s
-against ~304 ms for the batched scoring pass itself over a 50-candidate
-pool — construction, not inference, dominates this stage's latency, which
-is the strongest argument yet for Day 08 to own model lifecycle/caching.
+(see DECISIONS.md D-021), now honored by `mcp/server.py`'s `search_code`/
+`ask` implementations, its first real production callers. `rerank_score`
+(a raw cross-encoder logit) and the RRF `score` on the wrapped
+`HybridQueryResult` are never combined into a single number — only
+`rerank_score` determines the reordered output. `rerank` also accepts a
+pre-built `cross_encoder` (Day 08's additive parameter) to skip its own
+~9.7-9.9 s construction cost (D-021) per call — `mcp/server.py` constructs
+one at startup and reuses it for every tool call in the process's lifetime.
 
 `generation.pipeline.generate_answer` (Day 07, `tests/test_generation.py`)
-is the last non-MCP stage — Day 08's MCP tools call into this rather than
-adding new generation logic of their own (see D-022's flagged gap: no MCP
-tool in CLAUDE.md's contract table obviously exposes this yet). It never
+is the last non-MCP stage. Day 08's `ask` tool calls into this rather than
+adding new generation logic of its own (D-022's flagged gap -- no V1
+contract tool exposed a generated answer -- is resolved by adding `ask`,
+see D-023). It never
 calls a provider when `candidates` is empty — zero evidence means zero
 tokens spent. Otherwise it builds a strict evidence-only prompt
 (`generation.prompts`, each candidate tagged by `chunk_id`) and iterates
@@ -252,6 +268,26 @@ that comes back empty forces `has_sufficient_evidence=False` regardless of
 what the model claimed. See DECISIONS.md D-022 for the full design
 rationale, including the confirmed free-tier model per provider and the
 named, only-partially-mitigated prompt-injection risk.
+
+**`search_code`, `find_symbol`, `get_file_context` tools (Day 08,
+`tests/test_mcp_server.py`)** — none of these three call `generate_answer`;
+they return raw evidence only:
+- `search_code(query, top_k)`: `hybrid_search` (wide pool, cached indexes)
+  → `rerank` (cached `CrossEncoder`, `top_n=top_k`) → flatten each
+  `RerankedResult` into a `SearchHit` (file/symbol/line/content/score).
+- `find_symbol(symbol)`: reads the cached index's `.chunks` directly (no
+  retrieval/reranking at all) and does an exact-or-qualified-suffix match
+  on `chunk.symbol` (D-013's `ClassName.method` naming) — `score=1.0`
+  exact, `score=0.5` suffix, a match-quality indicator, not a retrieval
+  score. Definitions only; no usages/callers until Day 10's
+  `analyze_impact`. Zero matches is a normal empty result, never an error.
+- `get_file_context(file, start_line, end_line)`: resolves `file` against
+  the per-index manifest's `repo_root` (`indexing.manifest`, D-023),
+  verifies containment (mirrors `ingestion.scanner.scan`'s resolve-then-
+  `relative_to` discipline, raising instead of excluding), and reads the
+  exact requested line range directly from disk — never reconstructed from
+  indexed chunk content. Works for any real file under `repo_root`, not
+  only indexed ones (a named V1 limitation, see D-023).
 
 ---
 
@@ -326,6 +362,7 @@ configured provider.
 | Chunks        | Memory only (aggregated by `indexing.repo.collect_repo_chunks`) | `chunker/`, `indexing/repo.py` |
 | Vector index  | `INDEX_DIR/vector.faiss` + `INDEX_DIR/vector_metadata.json` | `indexing/vector.py` |
 | BM25 index    | `INDEX_DIR/bm25.pkl` + `INDEX_DIR/bm25_metadata.json` | `indexing/bm25.py`   |
+| Manifest      | `INDEX_DIR/manifest.json` (repo_root, source)          | `indexing/manifest.py` |
 | Logs          | stderr / `LOG_LEVEL`                   | `cli`, `mcp`     |
 | Caches        | `.cache/`, `.mypy_cache/`, `.ruff_cache/` (gitignored) | tooling  |
 

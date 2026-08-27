@@ -12,6 +12,7 @@ import pytest
 from codebase_rag_mcp.chunker.chunker import chunk_file
 from codebase_rag_mcp.chunker.models import Chunk
 from codebase_rag_mcp.indexing import repo
+from codebase_rag_mcp.indexing.manifest import load_manifest
 from codebase_rag_mcp.indexing.models import Bm25IndexStats, VectorIndexStats
 from codebase_rag_mcp.indexing.repo import build_all_indexes, collect_repo_chunks
 from codebase_rag_mcp.ingestion.scanner import scan
@@ -206,3 +207,36 @@ def test_build_all_indexes_returns_vector_and_bm25_stats_tuple(
     assert isinstance(vector_stats, VectorIndexStats)
     assert isinstance(bm25_stats, Bm25IndexStats)
     assert vector_stats.chunks_requested == bm25_stats.chunks_requested
+
+
+def test_build_all_indexes_writes_a_manifest_with_resolved_repo_root_and_given_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(tmp_path / "a.py", _PY_SOURCE)
+    monkeypatch.setattr(repo.vector, "build_index", _FakeStats.fake_vector_build_index)
+    monkeypatch.setattr(repo.bm25, "build_index", _FakeStats.fake_bm25_build_index)
+    index_dir = tmp_path / "idx"
+
+    build_all_indexes(tmp_path, index_dir=index_dir, repo="https://example.com/repo.git")
+
+    manifest = load_manifest(index_dir)
+    assert manifest is not None
+    assert manifest.repo_root == str(tmp_path.resolve())
+    assert manifest.source == "https://example.com/repo.git"
+
+
+def test_build_all_indexes_manifest_repo_root_matches_the_scanned_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _write(checkout / "a.py", _PY_SOURCE)
+    monkeypatch.setattr(repo.vector, "build_index", _FakeStats.fake_vector_build_index)
+    monkeypatch.setattr(repo.bm25, "build_index", _FakeStats.fake_bm25_build_index)
+    index_dir = tmp_path / "idx"
+
+    build_all_indexes(checkout, index_dir=index_dir)
+
+    manifest = load_manifest(index_dir)
+    assert manifest is not None
+    assert manifest.repo_root == str(checkout.resolve())

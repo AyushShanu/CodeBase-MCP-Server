@@ -1,8 +1,9 @@
 """MCP server entrypoint: exposes RAG tools over the Model Context Protocol.
 
-Not implemented yet beyond a stub :func:`run` that boots a server exposing
-a single placeholder ``ping`` tool. Real tools (``search``, ``impact``,
-``ask``, etc.) will be added as the rest of the pipeline lands.
+:func:`run` boots a real `mcp.server.MCPServer` (V1) exposing four tools --
+``search_code``, ``find_symbol``, ``get_file_context``, ``ask`` -- backed by
+the full ingestion/chunking/indexing/retrieval/reranking/generation
+pipeline. See ``mcp.server`` and DECISIONS.md D-023.
 """
 
 from codebase_rag_mcp.mcp.server import run

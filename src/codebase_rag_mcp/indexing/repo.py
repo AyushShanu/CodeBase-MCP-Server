@@ -13,7 +13,7 @@ from pathlib import Path
 from codebase_rag_mcp.chunker.chunker import chunk_file
 from codebase_rag_mcp.chunker.models import Chunk
 from codebase_rag_mcp.config import EMBEDDING_BATCH_SIZE, EMBEDDING_MODEL_NAME, INDEX_DIR
-from codebase_rag_mcp.indexing import bm25, vector
+from codebase_rag_mcp.indexing import bm25, manifest, vector
 from codebase_rag_mcp.indexing.models import (
     Bm25IndexStats,
     FileReadFailure,
@@ -96,6 +96,15 @@ def build_all_indexes(
     values on both indexes": `collect_repo_chunks` is called exactly once
     here, so there is no path in this codebase where the two index builds
     can independently observe a repo that changed between them.
+
+    Also writes `indexing.manifest.write_manifest(index_dir, repo_root=root,
+    source=repo)` immediately after both indexes build successfully --
+    `repo` (the raw ingestion source string, e.g. a GitHub URL or local
+    path) is reused as the manifest's `source` rather than adding a second,
+    possibly-diverging parameter. This is the one piece of state
+    `mcp.server`'s `get_file_context` needs to resolve a repo-relative
+    `Chunk.file` back to an absolute path in a process started fresh,
+    possibly long after this call returns (see DECISIONS.md D-023).
     """
     file_stats = scan(root)
     result = collect_repo_chunks(root, file_stats, repo=repo)
@@ -106,6 +115,7 @@ def build_all_indexes(
         batch_size=vector_batch_size,
     )
     bm25_stats = bm25.build_index(result.chunks, index_dir=index_dir)
+    manifest.write_manifest(index_dir, repo_root=root, source=repo)
     return vector_stats, bm25_stats
 
 
