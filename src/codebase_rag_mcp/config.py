@@ -34,6 +34,14 @@ def _getenv_int(name: str, default: int) -> int:
         return default
 
 
+def _getenv_float(name: str, default: float) -> float:
+    value = _getenv(name, str(default))
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 # --- Provider keys --------------------------------------------------------- #
 
 NVIDIA_API_KEY: Final[str] = _getenv("NVIDIA_API_KEY")
@@ -70,6 +78,31 @@ RERANKER_MAX_LENGTH: Final[int] = _getenv_int("RERANKER_MAX_LENGTH", 512)
 RERANK_TOP_N: Final[int] = _getenv_int("RERANK_TOP_N", 8)
 
 
+# --- Generation settings ---------------------------------------------------- #
+#
+# Per-provider default model, confirmed against each provider's genuinely
+# free tier as of 2026-08 (see DECISIONS.md D-022 for the confirmation
+# sources) -- catalogs drift, so these are overridable via env and are not
+# meant to be permanent. Note `meta/llama-3.1-8b-instruct` (NVIDIA's older
+# small default) was deprecated 2026-08-25 and is deliberately not used here.
+
+NVIDIA_MODEL_NAME: Final[str] = _getenv(
+    "NVIDIA_MODEL_NAME", "nvidia/llama-3.3-nemotron-super-49b-v1"
+)
+GROQ_MODEL_NAME: Final[str] = _getenv("GROQ_MODEL_NAME", "llama-3.1-8b-instant")
+OPENROUTER_MODEL_NAME: Final[str] = _getenv(
+    "OPENROUTER_MODEL_NAME", "meta-llama/llama-3.3-70b-instruct:free"
+)
+GEMINI_MODEL_NAME: Final[str] = _getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+
+GENERATION_TEMPERATURE: Final[float] = _getenv_float("GENERATION_TEMPERATURE", 0.1)
+GENERATION_MAX_TOKENS: Final[int] = _getenv_int("GENERATION_MAX_TOKENS", 1024)
+GENERATION_JSON_RETRY_LIMIT: Final[int] = _getenv_int("GENERATION_JSON_RETRY_LIMIT", 1)
+GENERATION_REQUEST_TIMEOUT_SECONDS: Final[int] = _getenv_int(
+    "GENERATION_REQUEST_TIMEOUT_SECONDS", 30
+)
+
+
 # --- Runtime configuration ------------------------------------------------- #
 
 LOG_LEVEL: Final[str] = _getenv("LOG_LEVEL", "INFO")
@@ -101,7 +134,13 @@ __all__ = [
     "EMBEDDING_BATCH_SIZE",
     "EMBEDDING_MODEL_NAME",
     "GEMINI_API_KEY",
+    "GEMINI_MODEL_NAME",
+    "GENERATION_JSON_RETRY_LIMIT",
+    "GENERATION_MAX_TOKENS",
+    "GENERATION_REQUEST_TIMEOUT_SECONDS",
+    "GENERATION_TEMPERATURE",
     "GROQ_API_KEY",
+    "GROQ_MODEL_NAME",
     "HYBRID_CANDIDATE_POOL_SIZE",
     "INDEX_DIR",
     "LOCAL_MODEL_API_KEY",
@@ -109,7 +148,9 @@ __all__ = [
     "LOCAL_MODEL_NAME",
     "LOG_LEVEL",
     "NVIDIA_API_KEY",
+    "NVIDIA_MODEL_NAME",
     "OPENROUTER_API_KEY",
+    "OPENROUTER_MODEL_NAME",
     "RERANKER_MAX_LENGTH",
     "RERANKER_MODEL_NAME",
     "RERANK_TOP_N",

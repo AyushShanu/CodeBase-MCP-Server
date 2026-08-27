@@ -661,3 +661,185 @@
   5 `exact_symbol`, 5 `semantic`, 4 `structural`) is committed as a tracked
   source file against the real `p-queue` clone and doubles as Day 11's V2
   eval set.
+
+## D-022 · LLM generation & citations: five-provider fallback chain, structured-JSON robustness, deterministic anti-fabrication (day-07-llm-generation-citations)
+
+- **Date:** 2026-08-26
+- **Status:** Accepted
+- **Context:** Day 06 left the pipeline at `reranker.rerank.rerank` —
+  quality-ordered evidence, not an answer. CLAUDE.md's Day 07 line calls
+  for "RAG generation through the NVIDIA NIM → Groq → OpenRouter fallback
+  chain," a strict evidence-only prompt, and a "not enough evidence"
+  fallback. Several decisions had to be made and logged.
+- **Decision — wire real adapters for all five candidate providers (NVIDIA,
+  Groq, OpenRouter, Gemini, Local), not one-plus-documented-alternatives.**
+  This diverges from Day 04/06's pattern (pick one model, document the rest
+  as swappable but unbuilt) because CLAUDE.md's requirement here is the
+  fallback chain's *runtime* behavior itself — "never a single hardcoded
+  provider" — not a single chosen model. A chain that only exists on paper
+  for four of five providers wouldn't satisfy that requirement.
+- **Decision — confirmed free-tier default model per provider** (checked
+  against each provider's live catalog/docs during implementation on
+  2026-08-26, not assumed from training data — all overridable via `.env`):
+  `NVIDIA_MODEL_NAME=nvidia/llama-3.3-nemotron-super-49b-v1` (NVIDIA's
+  older small default, `meta/llama-3.1-8b-instruct`, was deprecated
+  2026-08-25 — the day before this was checked — so it is deliberately not
+  used); `GROQ_MODEL_NAME=llama-3.1-8b-instant` (confirmed current,
+  free-tier); `OPENROUTER_MODEL_NAME=meta-llama/llama-3.3-70b-instruct:free`
+  (OpenRouter's free-model catalog rotates weekly by design; this slug was
+  reported as the longest-running/most-established free model as of
+  2026-08, not a permanent guarantee); `GEMINI_MODEL_NAME=gemini-2.5-flash`
+  (current stable free-tier model; `gemini-2.0-flash` was deprecated
+  mid-2026). `LOCAL_MODEL_NAME` has no default — the operator supplies
+  their own (e.g. CLAUDE.md's optional Qwen2.5-Coder-7B-Instruct Q4_K_M).
+- **Decision — config-time precedence and runtime fallback are two
+  distinct mechanisms, never conflated.** `providers.registry
+  .select_providers` decides *which providers are even candidates* (NVIDIA
+  → Groq → OpenRouter → Gemini → Local order, only those with a credential
+  set), purely from `.env` — it has no awareness of whether a call will
+  succeed. `pipeline.generate_answer` decides *runtime fallback* — it
+  iterates that ordered list and moves to the next candidate on a
+  `ProviderRequestError` (including a timeout) or an exhausted JSON-retry
+  budget. `NoProviderConfiguredError` (raised by `select_providers` when
+  the list would be empty) and `AllProvidersFailedError` (raised by
+  `generate_answer` once every candidate has actually failed) are kept as
+  distinct exception types precisely so callers/tests can tell "nothing
+  was ever configured" apart from "candidates existed and all failed" —
+  directly tested in `tests/test_generation.py`.
+- **Decision — no new dependency.** `httpx>=0.27` (declared in
+  `pyproject.toml` since Day 01, unused anywhere until this day) is
+  sufficient for all five providers' plain HTTPS/JSON REST endpoints — no
+  `openai`, `google-generativeai`, or other provider SDK was added. The
+  four OpenAI-chat-completions-shaped backends (NVIDIA, Groq, OpenRouter,
+  Local) share one `_openai_compatible.py` implementation, parametrized by
+  `base_url`/`api_key`/`model_name` — four call sites with an identical
+  request/response shape is exactly the "collapse three similar lines"
+  case, not premature abstraction. Gemini's `generateContent` REST shape
+  differs enough (auth via a `key=` query parameter, a different
+  `contents`/`systemInstruction` envelope) that it gets its own separate
+  adapter instead of being forced into the shared one.
+- **Decision — structured-JSON output via a dedicated extraction step,
+  not raw validation.** Free-tier instruct models routinely wrap valid
+  JSON in ` ```json ... ``` ` fences or add a sentence of prose despite
+  explicit instructions not to — a well-known, common failure mode.
+  `pipeline._extract_json_object` strips a leading/trailing code fence and
+  then brace-matches forward from the first `{`, tracking whether the scan
+  is inside a JSON string literal (respecting `\"` escapes) so a literal
+  brace inside the `"answer"` string value doesn't break the match — this
+  correctness detail is directly unit-tested
+  (`test_extract_json_object_handles_braces_inside_string_values`). This
+  runs on every provider's raw text *before*
+  `generation.models._LLMStructuredOutput.model_validate_json(...)` is
+  attempted, and never raises itself — an unparseable response fails
+  naturally at schema validation, counting as one JSON-retry attempt. As
+  defense-in-depth on top of this (not a substitute for it), the four
+  OpenAI-compatible adapters request `response_format: {"type":
+  "json_object"}` and the Gemini adapter requests `generationConfig
+  .responseMimeType: "application/json"` — neither is honored by every
+  free-tier model/provider combination, hence still needing the extraction
+  step.
+- **Decision — `GENERATION_JSON_RETRY_LIMIT` (default `1`) means retries
+  *after* the first attempt; total attempts per provider = limit + 1.**
+  Chosen over the alternative reading ("limit = total attempts") because
+  it makes `0` a coherent "no retries, one shot per provider" setting
+  rather than a confusing "zero attempts." A request-level failure
+  (`ProviderRequestError`) is never retried in place — only a
+  JSON-validation failure gets the same-provider repair-prompt retry; a
+  request failure moves straight to the next configured provider.
+- **Decision — `GENERATION_REQUEST_TIMEOUT_SECONDS` (default `30`),
+  passed explicitly to every `httpx` call.** Mirrors D-009's discipline for
+  `git clone` (`RepoCloneTimeoutError` rather than hanging indefinitely) —
+  Day 08 will call `generate_answer` synchronously from an MCP tool
+  handler, so an unbounded provider call would become a hung tool call
+  from Claude Code/Desktop's perspective. A timeout is caught and
+  re-raised as `ProviderRequestError`, participating in the normal
+  fallback-to-next-provider path exactly like any other request failure —
+  directly tested.
+- **Decision — deterministic, anti-fabrication citation attachment is the
+  actual "no fabricated citations" mechanism, not the prompt.** The model
+  supplies only `cited_chunk_ids` (a list of strings); `citations.attach
+  .attach_citations` is the *only* place a `Citation` is constructed, and
+  every field on it is copied from the matching
+  `candidate.hybrid_result.chunk` in the `candidates` this specific call
+  was given — never from anything the model's `answer` text asserts. An
+  ID absent from `candidates` (hallucinated or stale) is dropped silently
+  (logged at `warning`), never fabricated into a citation. A citation list
+  that comes back empty forces `GeneratedAnswer.has_sufficient_evidence`
+  to `False` regardless of what the model's own JSON claimed — a model
+  cannot assert sufficient evidence backed by zero real citations; this
+  override is directly unit-tested
+  (`test_generate_answer_forces_has_sufficient_evidence_false_when_cited_ids_are_all_unknown`).
+- **Decision — `Citation` is a flat 5-field projection of `Chunk`
+  (`chunk_id`, `file`, `symbol`, `start_line`, `end_line`), a deliberate
+  exception to the nest-don't-flatten convention `HybridQueryResult`/
+  `RerankedResult` established.** Those two models nest the full upstream
+  object because they exist for evidence *inspection* (comparing BM25 vs.
+  vector vs. rerank signals). A `Citation` exists to be handed back to a
+  tool caller/user as a small, final-answer-facing summary — nesting a
+  full `Chunk` (including its full `content` text) would leak retrieval
+  internals into what should be a minimal pointer. This is a conscious
+  divergence, not an inconsistency.
+- **Decision — named, only-partially-mitigated prompt-injection risk.**
+  This is the first day untrusted, attacker-reachable content (arbitrary
+  cloned-repo text — D-009's own "main untrusted-input boundary") is fed
+  into a live LLM prompt and turned into free-text prose a user reads. The
+  citation *mechanism* above is already well-protected — a malicious code
+  comment cannot fabricate a fake file/line claim that survives
+  `attach_citations`, since citations are never sourced from LLM text.
+  What is **not** protected is the `answer` string itself, unconstrained
+  model prose that could in principle be steered by adversarial text
+  inside a retrieved chunk. Full mitigation (content sanitization,
+  injection detection) is explicitly CLAUDE.md's own Day 11 scope
+  ("prompt-injection-aware handling") and is not rebuilt here — this day
+  adds only the one cheap, immediate mitigation available now:
+  `generation.prompts.SYSTEM_PROMPT` explicitly instructs the model that
+  evidence blocks are data to answer from, never instructions to follow,
+  even if their text appears to contain directives or commands (directly
+  string-asserted in
+  `test_system_prompt_instructs_that_evidence_blocks_are_data_not_instructions`).
+  Extended to Gemini's own auth scheme: since its API key lives in a `key=`
+  URL query parameter rather than an `Authorization` header, `gemini.py`
+  additionally never logs the full request URL verbatim on failure, only
+  the model name and HTTP status — the same "never log secrets" discipline
+  `base.py` states for the four header-authenticated providers, applied to
+  Gemini's different auth mechanism.
+- **Decision — `Provider` is a `typing.Protocol`, not an `abc.ABC`.** No
+  interface/ABC precedent exists anywhere else in this codebase; structural
+  typing lets `tests/test_generation.py`'s `_FakeProvider` satisfy the
+  interface without importing or subclassing anything, consistent with
+  this project's "don't build abstractions before they're needed" ethos.
+- **Decision — `httpx.MockTransport` injected via an optional
+  constructor-time `transport` parameter on `OpenAICompatibleProvider`/
+  `GeminiProvider`, not by monkeypatching `httpx.Client` globally.** Keeps
+  `Provider.complete(self, *, system, user)`'s signature exactly what the
+  interface specifies (no test-only parameters on the call itself); the
+  seam lives at construction time and defaults to `None` (a real client)
+  in production. Directly exercised in `tests/test_generation.py`'s
+  `_openai_compatible.py` request/timeout/parsing/error-wrapping/
+  no-secret-logging tests.
+- **Observation — manual smoke test against the real `p-queue` fixture
+  repo (Days 03–06's fixture): not run in this implementation session** —
+  no provider API key or local model server was available in this sandboxed
+  environment (`.env` does not exist; no `NVIDIA_API_KEY`/`GROQ_API_KEY`/
+  `OPENROUTER_API_KEY`/`GEMINI_API_KEY`/`LOCAL_MODEL_NAME` set). The full
+  automated test suite (`tests/test_generation.py`, `tests/test_citations.py`,
+  the `tests/test_config.py` additions) passes with zero real network calls
+  (`httpx.MockTransport` only), and `ruff check`/`ruff format --check`/
+  `mypy` all pass on the new code. **Pending:** the operator must run
+  `hybrid_search(..., top_k=HYBRID_CANDIDATE_POOL_SIZE)` → `rerank(...)` →
+  `generate_answer(...)` end-to-end against `benchmarks/questions.json`
+  with a real configured provider (at minimum one free-tier key), record
+  which provider actually served each call and its wall-clock time, and
+  confirm one deliberately off-topic question returns
+  `has_sufficient_evidence=False` honestly — then append those numbers
+  here.
+- **Consequences:** `generation/` and `citations/` are fully implemented
+  and tested end-to-end at the unit level; Day 08's MCP tools call into
+  `generation.pipeline.generate_answer` rather than adding new generation
+  logic. **Flagged, not silently resolved:** CLAUDE.md's MCP Tool Contract
+  table (`search_code`, `find_symbol`, `get_file_context`, `analyze_impact`,
+  `repository_summary`) has no tool that obviously exposes a generated
+  answer — `search_code`'s stated purpose is "returns ranked code
+  evidence," not "returns an answer." Day 08's spec must explicitly decide
+  whether `search_code` gains an answer-synthesis mode, a new tool
+  (e.g. `ask`) is added, or generation stays client-side.

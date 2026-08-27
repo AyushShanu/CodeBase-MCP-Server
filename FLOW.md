@@ -161,7 +161,9 @@ sequenceDiagram
     participant M as MCP server
     participant R as Retrieval
     participant X as Reranker
-    participant L as LLM provider
+    participant G as Generation (pipeline.generate_answer)
+    participant P as Provider chain
+    participant C as Citations
 
     U->>M: tools/call { name: "ask", arguments: {query} }
     M->>R: hybrid_search(query, top_k=HYBRID_CANDIDATE_POOL_SIZE, candidate_pool_size)
@@ -174,8 +176,31 @@ sequenceDiagram
     X-->>X: CrossEncoder(RERANKER_MODEL_NAME, max_length=RERANKER_MAX_LENGTH).predict([(query, c.chunk.content) for c in candidates])
     X-->>X: sort by rerank_score desc, take top_n (rerank_score and RRF score never combined)
     X-->>M: top_n RerankedResult, each wrapping its full HybridQueryResult
-    M->>L: chat(system, {query + cited chunks})
-    L-->>M: answer + cited chunk IDs
+    M->>G: generate_answer(query, candidates)
+    alt candidates is empty
+        G-->>M: GeneratedAnswer(insufficient evidence, provider_used=None) -- no provider ever called
+    else candidates non-empty
+        G-->>G: build system/user prompt (generation.prompts, evidence tagged by chunk_id)
+        G->>P: select_providers() -- NVIDIA -> Groq -> OpenRouter -> Gemini -> Local (config-time precedence)
+        loop for each configured provider, up to GENERATION_JSON_RETRY_LIMIT+1 attempts
+            P-->>P: provider.complete(system, user) -> raw text
+            alt ProviderRequestError (incl. timeout)
+                P-->>G: fall through to next provider (runtime fallback)
+            else raw text returned
+                G-->>G: _extract_json_object(raw) -- strip fences / brace-match
+                G-->>G: _LLMStructuredOutput.model_validate_json(extracted)
+                alt validation fails, attempts remain
+                    G-->>G: re-prompt same provider with validation error appended
+                else validation succeeds
+                    G-->>G: break -- this provider succeeded
+                end
+            end
+        end
+        G->>C: attach_citations(cited_chunk_ids, candidates)
+        C-->>G: list[Citation], sourced only from candidates' real Chunk metadata
+        G-->>G: has_sufficient_evidence = model's claim AND citations non-empty (anti-fabrication override)
+        G-->>M: GeneratedAnswer(answer, citations, has_sufficient_evidence, provider_used)
+    end
     M-->>U: {answer, citations}
 ```
 
@@ -203,28 +228,92 @@ against ~304 ms for the batched scoring pass itself over a 50-candidate
 pool — construction, not inference, dominates this stage's latency, which
 is the strongest argument yet for Day 08 to own model lifecycle/caching.
 
+`generation.pipeline.generate_answer` (Day 07, `tests/test_generation.py`)
+is the last non-MCP stage — Day 08's MCP tools call into this rather than
+adding new generation logic of their own (see D-022's flagged gap: no MCP
+tool in CLAUDE.md's contract table obviously exposes this yet). It never
+calls a provider when `candidates` is empty — zero evidence means zero
+tokens spent. Otherwise it builds a strict evidence-only prompt
+(`generation.prompts`, each candidate tagged by `chunk_id`) and iterates
+`generation.providers.registry.select_providers()`'s configured chain with
+**runtime** fallback-on-failure — a `ProviderRequestError` (including a
+timeout) or an exhausted `GENERATION_JSON_RETRY_LIMIT` moves to the next
+provider; only once every configured provider has failed does
+`AllProvidersFailedError` raise, distinct from `NoProviderConfiguredError`
+(raised earlier, at `select_providers()`, when nothing was ever a
+candidate). A provider's raw text is never trusted directly: it passes
+through `_extract_json_object` (defends against code-fence-wrapped or
+prose-prefixed JSON, a common free-tier model failure mode) before
+`_LLMStructuredOutput.model_validate_json(...)` validates it. The model
+only ever supplies `cited_chunk_ids` — `citations.attach.attach_citations`
+maps those back to real `Chunk` metadata from `candidates`, silently
+dropping any ID absent from the given candidate pool, and a citation list
+that comes back empty forces `has_sufficient_evidence=False` regardless of
+what the model claimed. See DECISIONS.md D-022 for the full design
+rationale, including the confirmed free-tier model per provider and the
+named, only-partially-mitigated prompt-injection risk.
+
 ---
 
 ## 4. Provider selection
+
+This section has two distinct mechanisms, kept deliberately separate (see
+DECISIONS.md D-022): **config-time precedence** (which providers are even
+candidates, decided once per call from `.env`) and **runtime
+fallback-on-failure** (which candidate's failure moves to the next,
+decided while `generate_answer` is actually running). Confusing the two
+would hide the difference between "nothing was ever configured"
+(`NoProviderConfiguredError`) and "candidates existed but every one failed"
+(`AllProvidersFailedError`).
+
+**Config-time precedence** — `generation.providers.registry.select_providers`:
 
 ```mermaid
 flowchart TD
     Cfg[Read .env] --> K1{NVIDIA_API_KEY set?}
     K1 -- yes --> P1[NVIDIA adapter]
     K1 -- no --> K2{GROQ_API_KEY set?}
+    P1 --> K2
     K2 -- yes --> P2[Groq adapter]
     K2 -- no --> K3{OPENROUTER_API_KEY set?}
+    P2 --> K3
     K3 -- yes --> P3[OpenRouter adapter]
     K3 -- no --> K4{GEMINI_API_KEY set?}
+    P3 --> K4
     K4 -- yes --> P4[Gemini adapter]
     K4 -- no --> K5{LOCAL_MODEL_NAME set?}
+    P4 --> K5
     K5 -- yes --> P5[Local OpenAI-compatible adapter]
-    K5 -- no --> X[Error: no provider configured]
+    K5 -- no --> Done[Return configured list, in this order]
+    P5 --> Done
+    Done -- list is empty --> X[NoProviderConfiguredError]
 ```
 
-Selection order is configurable in a future iteration; the precedence
-above keeps the most-specific provider keys first so an accidentally-
-populated local block does not silently override a paid provider.
+The precedence above keeps the most-specific provider keys first so an
+accidentally-populated local block does not silently override a paid
+provider. This selection is purely additive/ordering — it never inspects
+whether a provider will actually succeed.
+
+**Runtime fallback-on-failure** — `generation.pipeline.generate_answer`,
+consuming the ordered list above:
+
+```mermaid
+flowchart TD
+    Start[providers = select_providers list] --> Next{Any providers left to try?}
+    Next -- no --> Fail[AllProvidersFailedError]
+    Next -- yes --> Try[Call next provider.complete]
+    Try -- ProviderRequestError incl. timeout --> Next
+    Try -- raw text --> Extract[_extract_json_object then validate]
+    Extract -- invalid, retries remain --> Retry[Re-prompt same provider]
+    Retry --> Try
+    Extract -- invalid, retries exhausted --> Next
+    Extract -- valid --> Success[Use this provider's answer]
+```
+
+A provider is retried in place (same provider, corrected prompt) up to
+`GENERATION_JSON_RETRY_LIMIT` times for a JSON-validation failure only —
+a `ProviderRequestError` is never retried, it moves straight to the next
+configured provider.
 
 ---
 
