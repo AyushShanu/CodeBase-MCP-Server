@@ -44,19 +44,29 @@ def rerank(
     top_n: int = RERANK_TOP_N,
     model_name: str = RERANKER_MODEL_NAME,
     max_length: int = RERANKER_MAX_LENGTH,
+    cross_encoder: CrossEncoder | None = None,
 ) -> list[RerankedResult]:
     """Score every `(query, candidate.chunk.content)` pair with a fresh
     `CrossEncoder(model_name, max_length=max_length)`, sort by
     `rerank_score` descending, and return the top `min(top_n,
     len(candidates))` as `list[RerankedResult]`.
 
+    Pass an already-constructed `cross_encoder` to reuse it instead --
+    `rerank` then skips `CrossEncoder(model_name, max_length=max_length)`
+    entirely and calls `.predict()` on the given instance. Omitting it (the
+    default, `None`) is byte-for-byte identical to every prior day's
+    behavior. Day 08's MCP server is the first real caller of this
+    parameter, passing its startup-cached instance so the ~9.7-9.9s
+    construction cost D-021 measured never happens per query (see
+    DECISIONS.md D-023).
+
     Returns `[]` immediately for `candidates == []` -- without constructing
-    a `CrossEncoder` at all, mirroring `indexing.vector.embed_chunks`'s own
-    "skip the model entirely when there's nothing to embed" short-circuit --
-    so an empty hybrid result never pays real model-load cost. Never
-    validates or assumes a minimum `len(candidates)` (a small repo may
-    genuinely have fewer real matches than `HYBRID_CANDIDATE_POOL_SIZE`);
-    only ever caps output at `top_n`.
+    a `CrossEncoder` at all (even if `cross_encoder` was given), mirroring
+    `indexing.vector.embed_chunks`'s own "skip the model entirely when
+    there's nothing to embed" short-circuit -- so an empty hybrid result
+    never pays real model-load cost. Never validates or assumes a minimum
+    `len(candidates)` (a small repo may genuinely have fewer real matches
+    than `HYBRID_CANDIDATE_POOL_SIZE`); only ever caps output at `top_n`.
 
     Calls `CrossEncoder.predict()` exactly once with the full batched list
     of pairs -- never once per candidate -- mirroring
@@ -68,10 +78,15 @@ def rerank(
     if not candidates:
         return []
 
-    try:
-        model = CrossEncoder(model_name, max_length=max_length)
-    except Exception as exc:
-        raise RerankerModelError(f"failed to load reranker model {model_name!r}: {exc}") from exc
+    if cross_encoder is not None:
+        model = cross_encoder
+    else:
+        try:
+            model = CrossEncoder(model_name, max_length=max_length)
+        except Exception as exc:
+            raise RerankerModelError(
+                f"failed to load reranker model {model_name!r}: {exc}"
+            ) from exc
 
     pairs = [(query, candidate.chunk.content) for candidate in candidates]
     try:

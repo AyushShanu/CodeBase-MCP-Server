@@ -270,6 +270,27 @@ def test_rerank_wraps_model_construction_failure_in_reranker_model_error(
         rerank_module.rerank("query", [_hybrid_result("a")])
 
 
+def test_rerank_uses_given_cross_encoder_instead_of_constructing_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    query = "query"
+    candidate = _hybrid_result("a", content="content-a")
+    _FakeCrossEncoder.score_map = {(query, "content-a"): 0.7}
+    preloaded = _FakeCrossEncoder("preloaded-model")
+    _FakeCrossEncoder.instances = []  # discard the construction just above
+
+    def _fail_if_constructed(*args: object, **kwargs: object) -> None:
+        raise AssertionError("CrossEncoder must not be constructed when cross_encoder is given")
+
+    monkeypatch.setattr(rerank_module, "CrossEncoder", _fail_if_constructed)
+
+    results = rerank_module.rerank(query, [candidate], cross_encoder=preloaded)
+
+    assert results[0].rerank_score == 0.7
+    assert _FakeCrossEncoder.instances == []
+    assert len(_FakeCrossEncoder.calls) == 1
+
+
 def test_rerank_wraps_predict_failure_in_reranker_model_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

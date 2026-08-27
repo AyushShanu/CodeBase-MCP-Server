@@ -1,23 +1,25 @@
 """Command-line entrypoint for ``codebase-rag``.
 
-Subcommands are intentionally minimal at the scaffold stage. Today the
-CLI supports ``--version`` and ``serve`` so the package can be installed
-and exercised end-to-end without any RAG pipeline code yet.
+Subcommands are intentionally minimal. ``index`` is the bare enabler Day 08
+needs to make ``serve``'s tools runnable against a real repo end-to-end --
+it is not the CLI polish (flags, progress bars, incremental re-indexing)
+CLAUDE.md already scopes to Day 11.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-from typing import Sequence
+from collections.abc import Sequence
 
 from codebase_rag_mcp import __version__
+from codebase_rag_mcp.config import INDEX_DIR
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="codebase-rag",
-        description="Codebase RAG MCP server (scaffold stage).",
+        description="Codebase RAG MCP server.",
     )
     parser.add_argument(
         "--version",
@@ -26,12 +28,48 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command")
 
+    index_parser = sub.add_parser(
+        "index",
+        help="Clone/scan a repository and build its vector + BM25 indexes.",
+    )
+    index_parser.add_argument(
+        "source",
+        help="An https:// git URL or a local filesystem path to index.",
+    )
+    index_parser.add_argument(
+        "--index-dir",
+        default=INDEX_DIR,
+        help=f"Directory to write the index into (default: {INDEX_DIR}).",
+    )
+
     sub.add_parser(
         "serve",
-        help="Run the MCP server over stdio (stub: responds to list_tools with a 'ping' tool).",
+        help="Run the MCP server (search_code, find_symbol, get_file_context, ask) over stdio.",
     )
 
     return parser
+
+
+def _run_index(source: str, index_dir: str) -> int:
+    """Ingest `source` and build its vector + BM25 indexes under `index_dir`.
+
+    Lazy-imports `ingestion`/`indexing` so `--version`/`--help` stay fast.
+    Prints basic stats and the manifest's `repo_root` on success.
+    """
+    from codebase_rag_mcp.indexing.repo import build_all_indexes
+    from codebase_rag_mcp.ingestion.loader import load_repo
+
+    repo_source = load_repo(source)
+    vector_stats, bm25_stats = build_all_indexes(repo_source.root, index_dir=index_dir, repo=source)
+    sys.stdout.write(
+        f"Indexed {source!r} -> {index_dir}\n"
+        f"  checkout root: {repo_source.root}\n"
+        f"  vector: {vector_stats.chunks_embedded} embedded, "
+        f"{vector_stats.chunks_skipped} skipped (dim={vector_stats.embedding_dimension})\n"
+        f"  bm25:   {bm25_stats.chunks_indexed} indexed, "
+        f"{bm25_stats.chunks_skipped} skipped (vocab={bm25_stats.vocabulary_size})\n"
+    )
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -45,6 +83,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.version:
         sys.stdout.write(f"codebase-rag {__version__}\n")
         return 0
+
+    if args.command == "index":
+        return _run_index(args.source, args.index_dir)
 
     if args.command == "serve":
         # Lazy import keeps the CLI snappy when only --version is requested.

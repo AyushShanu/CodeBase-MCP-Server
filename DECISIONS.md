@@ -843,3 +843,193 @@
   evidence," not "returns an answer." Day 08's spec must explicitly decide
   whether `search_code` gains an answer-synthesis mode, a new tool
   (e.g. `ask`) is added, or generation stays client-side.
+
+## D-023 · MCP server V1: SDK migration, ask tool, startup caching, manifest, stdout/stderr discipline, asyncio.Lock (day-08-mcp-server-v1)
+
+- **Date:** 2026-08-27
+- **Status:** Accepted
+- **Context:** Days 02–07 built a fully independent, well-tested pipeline
+  that nothing outside `tests/` had ever driven end-to-end. Day 08 turns it
+  into a real MCP server. Four things made this larger than "wire four
+  functions together," each requiring its own decision.
+- **Decision — migrate off the low-level `mcp.server.Server` API onto
+  `mcp.server.MCPServer`.** The Day 01 stub and `tests/test_mcp_server.py`
+  used `Server`'s `@server.list_tools()`/`@server.call_tool()` decorators,
+  which do not exist on the installed `mcp==2.0.0` (`pyproject.toml` only
+  pinned `mcp>=1.0`) — confirmed directly: `AttributeError: 'Server' object
+  has no attribute 'list_tools'`. This was a genuine, silent version drift:
+  3 pre-existing `mypy`/`pytest` failures on `main` predate this spec.
+  `MCPServer` (the SDK's `mcp.server.fastmcp` → `mcp.server.mcpserver`
+  rename) is the current high-level API: `@server.tool()` derives both
+  JSON input and output schema from a plain function's type hints,
+  including full Pydantic support for both params and return type
+  (verified directly: a function returning a Pydantic `BaseModel` produces
+  a matching `structured_content` dict with no hand-written JSON Schema).
+  Exception handling over the real stdio transport is automatic —
+  `MCPServer._handle_call_tool` wraps any plain exception (not `MCPError`)
+  into `CallToolResult(content=[TextContent(text=str(e))], is_error=True)`,
+  confirmed by reading the wiring into `run()`'s dispatch loop, not just
+  the `call_tool()` convenience method — so tool functions raise clear,
+  typed exceptions and rely on the SDK for clean error surfacing, never
+  hand-rolling try/except-and-format per tool.
+- **Decision — tighten `pyproject.toml`'s `mcp>=1.0` to `mcp>=2.0,<3.0`.**
+  Mirrors D-014's `tree-sitter` pin precedent (pin after finding a real
+  regression) — a future `mcp` major bump now fails loudly at install time
+  instead of silently reintroducing this same class of breakage.
+- **Decision — add a fourth tool, `ask`, beyond CLAUDE.md's literal V1
+  table.** Resolves D-022's own flagged gap (no V1 tool exposed a generated
+  answer) using the name `FLOW.md`'s Section 3 heading had already
+  anticipated. `ask` wires the full pipeline
+  (`hybrid_search` → `rerank` → `generate_answer`) and returns
+  `generation.models.GeneratedAnswer` directly — no wrapper model needed,
+  it is already tool-response-shaped. CLAUDE.md's "MCP Tool Contract" table
+  now has an `ask` row (V1) reflecting this, rather than staying silently
+  out of sync with what was actually built.
+- **Decision — startup-time caching via `MCPServer`'s `lifespan` async
+  context manager, exactly fulfilling what D-020/D-021 explicitly
+  deferred to "Day 08's MCP server."** The vector index, BM25 index, one
+  `CrossEncoder`, and (see below) one embedding-model instance are each
+  loaded/constructed exactly once per server connection and reused for
+  every subsequent tool call — D-021 measured `CrossEncoder` construction
+  at ~9.7-9.9s, far too slow to pay per call. Mechanism, confirmed by
+  running real code against the installed SDK: a tool function declares a
+  `ctx: Context[_ServerState, Any]` parameter and reads
+  `ctx.request_context.lifespan_context` (**not** `ctx.lifespan`, a
+  different, unpopulated attribute on a different `Context` class) — the
+  same object (`id()`-identical) is threaded across every tool call in one
+  connection's lifetime, verified directly. `retrieval.hybrid.hybrid_search`
+  and `reranker.rerank.rerank` each gained purely additive optional
+  parameters (`bm25_index`/`vector_index`/`embeddings` and `cross_encoder`
+  respectively) — `None` (the default) preserves every prior day's exact
+  behavior byte-for-byte; every pre-existing test in
+  `tests/test_retrieval_hybrid.py`/`tests/test_reranker.py` passes
+  unmodified. `mcp/server.py` is the first real caller passing its cached
+  instances through.
+- **Observation, discovered while testing this day's own caching goal —
+  `VectorIndex.query`'s per-call embedding-model construction was itself
+  uncached and undermined the day's stated purpose.** Caching the
+  `VectorIndex`/`Bm25Index` *objects* (as originally scoped) left
+  `VectorIndex.query`'s internal `embed_texts([text], ...)` call
+  constructing a fresh `HuggingFaceEmbeddings` instance on *every single
+  query* regardless — confirmed by a counting test (1 construction per
+  `.query()` call, `0` extra from `load_index` itself) — and each
+  construction was found to trigger real network calls to
+  huggingface.co (an "is this model current" check), directly
+  contradicting CLAUDE.md's "embedding models run locally by default"
+  principle for the query path specifically. **Decision (scope extended
+  after flagging to the user): give `indexing.vector.embed_texts` and
+  `VectorIndex.query` the identical additive-optional-parameter treatment**
+  (`embeddings: HuggingFaceEmbeddings | None = None`, threaded through
+  `hybrid_search`'s new `embeddings` parameter) — `mcp/server.py`'s
+  `_ServerState` now also holds one cached `embeddings` instance
+  (constructed only when `vector_index is not None` — no point building it
+  otherwise), verified to be constructed exactly once across multiple
+  `search_code`/`ask` calls in the same manual smoke-test session as the
+  `CrossEncoder`/index counts.
+- **Decision — the per-index manifest (`indexing/manifest.py`,
+  `IndexManifest(repo_root, source)`) is the one piece of state
+  `get_file_context` needs.** `Chunk.file` is repo-relative by design;
+  nothing before this day recorded the absolute checkout root anywhere
+  persisted, so a `codebase-rag serve` process started fresh (a different
+  process, possibly long after `codebase-rag index` ran) had no way to
+  resolve a chunk's `file` back to a real path. `indexing.repo
+  .build_all_indexes` writes it immediately after both index builds
+  succeed, reusing the function's existing `repo: str = ""` parameter as
+  the manifest's `source` rather than adding a second, possibly-diverging
+  field. `load_manifest` never raises — a missing manifest (an
+  older/manifest-less index) degrades `get_file_context` to a clear
+  per-call `RepoRootUnknownError`, not a server-startup failure, since the
+  other three tools don't need it.
+- **Decision — `get_file_context`'s scope is "any real file under
+  `repo_root`," not "any file that was actually indexed" — a named,
+  accepted V1 limitation.** CLAUDE.md's own Day 11 line names "secret-file
+  exclusion" as planned, unbuilt V2 scope, meaning a checked-out repo can
+  contain a file (e.g. a committed `.env`) that Day 02's ingestion filters
+  correctly excluded from chunking but that is still physically present
+  under `repo_root` and therefore readable through this tool today. Not
+  rebuilt here — same deferral pattern D-022 used for prompt-injection
+  hardening.
+- **Decision — `get_file_context`'s path-containment check mirrors
+  `ingestion.scanner.scan`'s exact resolve-then-`relative_to` discipline**
+  (`Path.resolve(strict=True)` on the root, then `resolved.relative_to
+  (root_real)` catching `ValueError` to detect an escape — including one
+  only visible after resolving an intermediate symlink), applied fresh as
+  a new, separate `get_file_context`-specific check rather than reusing
+  `scanner.py`'s code path directly, since this is single-request file I/O
+  at query time, not a bulk directory walk. Unlike `scan()`'s
+  "exclude-and-continue," a single explicit request *raises*
+  `PathOutsideRepoRootError` — tested with both a plain `../` traversal and
+  a real symlink escaping `repo_root`. This is the one cheap containment
+  check this day adds; full "path restriction" hardening stays Day 11
+  scope (CLAUDE.md's own line), the same "one cheap mitigation now, full
+  hardening later" pattern D-022 established for prompt injection.
+- **Decision — `find_symbol`'s exact + qualified-suffix matching, with an
+  explicitly non-retrieval `score`.** `chunk.symbol == symbol` is exact
+  (`score=1.0`); `chunk.symbol.endswith(f".{symbol}")` matches a bare name
+  against a qualified name's trailing component (e.g. `"pause"` matches
+  `"PQueue.pause"`, per D-013's `ClassName.method` naming) at `score=0.5`.
+  These scores are a match-quality indicator only — `find_symbol` is a
+  deterministic lookup over cached `.chunks`, not a ranking model, unlike
+  `search_code`'s `score` (a real cross-encoder logit). Definitions only:
+  no usages/callers/references until Day 10's `analyze_impact` — stated in
+  the tool's own description, not just this file, so the limitation is
+  visible to whatever client calls it. Zero matches returns `matches: []`,
+  never an error, mirroring `hybrid_search`/`rerank`'s own "empty is a
+  valid result" convention.
+- **Decision — stdout/stderr discipline: environment variables plus
+  explicit `logging.basicConfig(stream=sys.stderr, ...)`, set at the very
+  top of `mcp/server.py` before any pipeline import.** stdio's JSON-RPC
+  stream lives on stdout; `sentence-transformers`/`transformers`/
+  `huggingface_hub` print progress/verbosity noise directly to stdout on
+  first model construction, bypassing `logging` entirely — confirmed by
+  running the module and capturing stdout/stderr separately: with the
+  discipline in place, a full startup (FAISS load, embedding + reranker
+  model construction) produces zero stdout output, all log lines landing
+  on stderr. Sets `HF_HUB_DISABLE_PROGRESS_BARS=1`, `TRANSFORMERS_VERBOSITY
+  =error`, `TOKENIZERS_PARALLELISM=false` via `os.environ.setdefault(...)`
+  (never overriding an operator's own explicit setting) before importing
+  `indexing`/`reranker`/`generation`/`sentence_transformers`/
+  `langchain_huggingface` anywhere in the module — this forces `# noqa:
+  E402` on every import below that point, which is intentional and stated
+  in the module's own docstring, not something to "fix" later.
+- **Decision — a single `asyncio.Lock` in `_ServerState` guards
+  `hybrid_search`/`rerank` (used by `search_code`/`ask`); `get_file_context`
+  never acquires it (touches only the immutable `manifest` reference), and
+  `ask`'s `generate_answer` call runs outside it (a network call, not
+  shared local-model state, so serializing it against `search_code`/
+  `find_symbol` would cost latency for no safety benefit).** **Honest
+  finding, stated explicitly rather than left implicit:** `hybrid_search`
+  and `rerank` are and must stay fully synchronous (D-020/D-021's own
+  constraint) — a tool coroutine's `async with state.lock: <synchronous
+  call>` has no `await` inside the critical section, so Python's
+  single-threaded asyncio scheduler cannot switch tasks there regardless of
+  whether the lock exists. No test routed through the real, synchronous
+  pipeline functions can meaningfully falsify "the lock does nothing." The
+  lock is still a deliberate, forward-looking invariant (declared correct
+  as this codebase's helpers exist today; would start mattering the moment
+  either helper ever gains a genuine `await`, e.g. an async model backend),
+  not an unconsidered gap — tested by isolating the exact locking *pattern*
+  `search_code`/`ask` use around a stand-in coroutine that has a genuine
+  internal `await`, proving two `asyncio.gather`'d holders never interleave.
+- **Decision — a minimal `codebase-rag index <source>` CLI subcommand,**
+  the bare enabler needed to make the MCP server's own tools runnable
+  end-to-end against a real repo (`ingestion.loader.load_repo` →
+  `indexing.repo.build_all_indexes`, printing basic stats). Deliberately
+  not CLI polish (flags, progress bars, incremental re-indexing) — that
+  stays Day 11 scope, as CLAUDE.md already states.
+- **Observation — real end-to-end smoke test** (a 3-chunk fixture repo,
+  fake embeddings/CrossEncoder, real `MCPServer`/lifespan/dispatch via
+  `mcp.client._memory.InMemoryTransport` + `ClientSession`): `search_code`,
+  `find_symbol` (exact and qualified-suffix), `get_file_context` (including
+  a rejected `../` traversal and a rejected symlink escape), and `ask`
+  (honest `is_error` failure with a clear message when no provider is
+  configured, the expected state for a fresh clone with no `.env`) all
+  behaved as designed. A direct counting test confirmed `HuggingFaceEmbeddings`
+  and `CrossEncoder` are each constructed exactly once across two
+  `search_code` calls plus one `ask` call in the same connection.
+- **Consequences:** `mcp/server.py`'s `ping` stub is fully removed, not
+  kept alongside the real tools. `generation`/`citations` (Day 07) are
+  consumed unchanged. Day 10's `analyze_impact`/`repository_summary` (V2)
+  remain unbuilt; `find_symbol`'s "definitions only" and
+  `get_file_context`'s "any real file under repo_root" limitations are
+  the explicit seams Day 10/11 pick up.

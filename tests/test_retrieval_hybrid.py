@@ -10,6 +10,7 @@ import pytest
 from codebase_rag_mcp.chunker.models import Chunk
 from codebase_rag_mcp.indexing import bm25, vector
 from codebase_rag_mcp.parser.models import SymbolKind
+from codebase_rag_mcp.retrieval import hybrid as hybrid_module
 from codebase_rag_mcp.retrieval.exceptions import NoIndexAvailableError
 from codebase_rag_mcp.retrieval.hybrid import hybrid_search
 
@@ -207,3 +208,107 @@ def test_hybrid_search_proceeds_when_only_vector_index_is_built(tmp_path: Path) 
     assert results
     assert results[0].vector_rank is not None
     assert results[0].bm25_rank is None
+
+
+# --- pre-loaded index caching (Day 08) --------------------------------------------- #
+
+
+def test_hybrid_search_uses_given_vector_index_instead_of_loading_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    query = "alpha"
+    target = _chunk("target", "def alpha(): pass")
+    _ControlledEmbeddings.vectors = {query: [1.0, 0.0, 0.0], target.content: [1.0, 0.0, 0.0]}
+    index_dir = tmp_path / "idx"
+    _build_vector([target], index_dir)
+    _build_bm25([target], index_dir)
+    preloaded_vector_index = vector.load_index(index_dir=index_dir)
+
+    def _fail_if_called(*args: object, **kwargs: object) -> None:
+        raise AssertionError("vector.load_index must not be called when vector_index is given")
+
+    monkeypatch.setattr(hybrid_module.vector, "load_index", _fail_if_called)
+
+    results = hybrid_search(query, index_dir=index_dir, vector_index=preloaded_vector_index)
+
+    assert results
+    assert results[0].chunk.id == "target"
+
+
+def test_hybrid_search_uses_given_bm25_index_instead_of_loading_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _chunk("target", "function generateToken(user) { return sign(user); }")
+    index_dir = tmp_path / "idx"
+    _build_vector([target], index_dir)
+    _build_bm25([target], index_dir)
+    preloaded_bm25_index = bm25.load_index(index_dir=index_dir)
+
+    def _fail_if_called(*args: object, **kwargs: object) -> None:
+        raise AssertionError("bm25.load_index must not be called when bm25_index is given")
+
+    monkeypatch.setattr(hybrid_module.bm25, "load_index", _fail_if_called)
+
+    results = hybrid_search("generateToken", index_dir=index_dir, bm25_index=preloaded_bm25_index)
+
+    assert results
+    assert results[0].chunk.id == "target"
+
+
+def test_hybrid_search_passes_given_embeddings_through_to_vector_index_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    query = "alpha"
+    target = _chunk("target", "def alpha(): pass")
+    _ControlledEmbeddings.vectors = {query: [1.0, 0.0, 0.0], target.content: [1.0, 0.0, 0.0]}
+    index_dir = tmp_path / "idx"
+    _build_vector([target], index_dir)
+    preloaded_vector_index = vector.load_index(index_dir=index_dir)
+    preloaded_embeddings = _ControlledEmbeddings()
+
+    captured: dict[str, object] = {}
+    real_query = preloaded_vector_index.query
+
+    def _spy_query(text: str, **kwargs: object) -> object:
+        captured["embeddings"] = kwargs.get("embeddings")
+        return real_query(text, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(preloaded_vector_index, "query", _spy_query)
+
+    hybrid_search(
+        query,
+        index_dir=index_dir,
+        vector_index=preloaded_vector_index,
+        embeddings=preloaded_embeddings,
+    )
+
+    assert captured["embeddings"] is preloaded_embeddings
+
+
+def test_hybrid_search_with_both_preloaded_indexes_never_touches_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    query = "alpha"
+    target = _chunk("target", "def alpha(): pass")
+    _ControlledEmbeddings.vectors = {query: [1.0, 0.0, 0.0], target.content: [1.0, 0.0, 0.0]}
+    index_dir = tmp_path / "idx"
+    _build_vector([target], index_dir)
+    _build_bm25([target], index_dir)
+    preloaded_vector_index = vector.load_index(index_dir=index_dir)
+    preloaded_bm25_index = bm25.load_index(index_dir=index_dir)
+
+    def _fail_if_called(*args: object, **kwargs: object) -> None:
+        raise AssertionError("load_index must not be called when both indexes are given")
+
+    monkeypatch.setattr(hybrid_module.vector, "load_index", _fail_if_called)
+    monkeypatch.setattr(hybrid_module.bm25, "load_index", _fail_if_called)
+
+    results = hybrid_search(
+        query,
+        index_dir=tmp_path / "nonexistent-index-dir-never-touched",
+        vector_index=preloaded_vector_index,
+        bm25_index=preloaded_bm25_index,
+    )
+
+    assert results
+    assert results[0].chunk.id == "target"
