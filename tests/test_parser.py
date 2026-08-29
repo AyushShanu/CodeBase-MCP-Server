@@ -15,7 +15,7 @@ import pytest
 from codebase_rag_mcp.parser.exceptions import UnsupportedLanguageError
 from codebase_rag_mcp.parser.extractor import parse_file
 from codebase_rag_mcp.parser.grammars import get_cached_parser, resolve_grammar_name
-from codebase_rag_mcp.parser.models import SymbolKind
+from codebase_rag_mcp.parser.models import ReferenceKind, SymbolKind
 
 # --- grammars: language + .tsx routing --------------------------------------- #
 
@@ -249,3 +249,103 @@ class Widget:
     # Decorated method's span starts at the "@staticmethod" line, not "def".
     assert by_name["Widget.helper"].start_line == 9
     assert result.parse_errors == []
+
+
+# --- parse_file: reference extraction (calls + imports) ---------------------- #
+
+
+def test_parse_file_ts_extracts_call_references_bare_and_member_and_chained() -> None:
+    source = b"""function outer() {
+  bareCall();
+  obj.method();
+  a.b.c();
+}
+"""
+    result = parse_file(Path("x.ts"), "typescript", source)
+
+    calls = [(r.name, r.kind, r.line) for r in result.references if r.kind is ReferenceKind.CALL]
+    assert ("bareCall", ReferenceKind.CALL, 2) in calls
+    assert ("method", ReferenceKind.CALL, 3) in calls
+    assert ("c", ReferenceKind.CALL, 4) in calls
+
+
+def test_parse_file_ts_extracts_import_reference_module_and_name() -> None:
+    source = b'import { foo } from "./mod";\n'
+    result = parse_file(Path("x.ts"), "typescript", source)
+
+    imports = [r for r in result.references if r.kind is ReferenceKind.IMPORT]
+    assert len(imports) == 1
+    assert imports[0].module == "./mod"
+    assert imports[0].name == "mod"
+    assert imports[0].line == 1
+
+
+def test_parse_file_ts_new_expression_is_not_captured_as_a_call() -> None:
+    source = b"""function outer() {
+  new Widget();
+}
+"""
+    result = parse_file(Path("x.ts"), "typescript", source)
+
+    names = {r.name for r in result.references if r.kind is ReferenceKind.CALL}
+    assert "Widget" not in names
+
+
+def test_parse_file_python_extracts_call_references_bare_and_attribute_and_chained() -> None:
+    source = b"""def outer():
+    bare_call()
+    obj.method()
+    a.b.c()
+"""
+    result = parse_file(Path("m.py"), "python", source)
+
+    calls = [(r.name, r.kind, r.line) for r in result.references if r.kind is ReferenceKind.CALL]
+    assert ("bare_call", ReferenceKind.CALL, 2) in calls
+    assert ("method", ReferenceKind.CALL, 3) in calls
+    assert ("c", ReferenceKind.CALL, 4) in calls
+
+
+def test_parse_file_python_extracts_import_and_import_from_references() -> None:
+    source = b"""import os
+import os.path
+import os, sys
+from foo.bar import baz
+"""
+    result = parse_file(Path("m.py"), "python", source)
+
+    imports = [r for r in result.references if r.kind is ReferenceKind.IMPORT]
+    modules = [(r.module, r.line) for r in imports]
+    assert ("os", 1) in modules
+    assert ("os.path", 2) in modules
+    assert ("os", 3) in modules
+    assert ("sys", 3) in modules
+    assert ("foo.bar", 4) in modules
+    # `import os, sys` -> two distinct references, not one.
+    assert modules.count(("os", 3)) == 1
+
+
+def test_parse_file_reference_extraction_never_raises_for_unrecognized_call_shape() -> None:
+    source = b"""def outer():
+    handlers[key]()
+    normal_call()
+"""
+    result = parse_file(Path("m.py"), "python", source)
+
+    assert result.parse_errors == []
+    names = {r.name for r in result.references if r.kind is ReferenceKind.CALL}
+    assert "normal_call" in names
+
+
+def test_parse_file_reference_walk_recurses_into_function_bodies_unlike_symbol_walk() -> None:
+    source = b"""def outer():
+    def inner():
+        nested_call()
+    return inner
+"""
+    result = parse_file(Path("m.py"), "python", source)
+
+    # The symbol walk deliberately excludes "inner" from result.symbols
+    # (nested helpers are not top-level symbols) -- but the reference walk
+    # must still find the call inside it.
+    assert "inner" not in {s.name for s in result.symbols}
+    assert "nested_call" in {r.name for r in result.references if r.kind is ReferenceKind.CALL}

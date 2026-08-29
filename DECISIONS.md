@@ -1033,3 +1033,171 @@
   remain unbuilt; `find_symbol`'s "definitions only" and
   `get_file_context`'s "any real file under repo_root" limitations are
   the explicit seams Day 10/11 pick up.
+
+---
+
+## D-024 · Symbols, references & impact analysis: reference-scanner node types, `#partN`/whole-file-fallback `caller_symbol` convention, full-path-before-basename import resolution, `is_likely_test` heuristic, `MAX_IMPACT_REFERENCES_PER_KIND` cap, graceful LLM degradation (day-10-symbol-impact-analysis)
+
+- **Date:** 2026-08-28
+- **Status:** Accepted
+- **Context:** `find_symbol` (Day 08) only ever looked up symbol
+  *definitions* — its own docstring already named "reference tracking" as
+  Day 10 scope. This day adds that missing layer and the `analyze_impact`
+  tool CLAUDE.md's demo question 4 needs. Several sub-decisions below.
+- **Decision — a second, full-tree recursive Tree-sitter walk per
+  language family (`parser/extractor.py`), run against the same
+  already-parsed tree, never a second `parser.parse()` call.** The
+  existing symbol walk (`_dispatch_ts_js`/`_dispatch_python`) is
+  deliberately stop-early (never recurses into function/method bodies,
+  keeping nested helpers/callbacks out of the symbol list); the reference
+  walk needs the opposite policy since calls happen inside those bodies.
+  Node/field shapes were empirically verified (not assumed from memory)
+  against this repo's installed `tree_sitter_language_pack` before
+  writing extraction code:
+  - Python `call`: callee under field `"function"`; bare = `identifier`;
+    `obj.method()`/`a.b.c()` = `attribute` with its own `"attribute"`
+    field already isolating the trailing name (no manual chain-walking).
+  - Python `import_statement`: **no `module_name` field** — each named
+    module is a `children_by_field_name("name")` child, either a
+    `dotted_name` or an `aliased_import` (whose own `"name"` field holds
+    the `dotted_name`). One `RawReference` **per distinct module**
+    (`import os, sys` → two), since they are genuinely different modules.
+  - Python `import_from_statement`: has `"module_name"` → `dotted_name`.
+    One `RawReference` for the **whole statement** (`from a.b import c, d`
+    → one reference, `module="a.b"`) since every imported name shares one
+    source module and resolution is module-path-only, never
+    per-imported-name. `from . import x`'s `module_name` field IS present
+    but has type `relative_import` (decoded text `"."`) — decoded as-is
+    rather than specially resolved; a `"."` module never matches anything
+    meaningful during resolution, a deliberate, accepted V2 gap.
+  - TS/JS/TSX `call_expression`: callee under field `"function"`; bare =
+    `identifier`; `obj.method()`/`a.b.c()` = `member_expression` with its
+    own `"property"` field. `new Widget()` is a **different** node type
+    (`new_expression`) — deliberately not captured (spec names only
+    `call_expression`).
+  - TS/JS/TSX `import_statement`: field `"source"` → a `string` node;
+    unquoted specifier read from its `string_fragment` named child
+    (falling back to quote-stripping if absent). Same extraction function
+    reused for `typescript`/`tsx`/`javascript` (mirrors `_EXTRACTORS`'s
+    existing three-key mapping).
+- **Decision — `indexing/references.py`'s `load_index` hybrid: absence
+  of `references.json` returns `None` (never raises, mirrors
+  `manifest.load_manifest`'s leniency); corruption of a file that DOES
+  exist raises `ReferenceIndexLoadError` (mirrors `vector`/`bm25.load_index`'s
+  strictness).** Deliberately not a pure copy of either existing pattern
+  — an absent index is a normal state (older index, or zero recognized
+  references), while a broken-but-present file is a real data-integrity
+  problem that should never be silently swallowed into "pretend it
+  doesn't exist." Confirmed with the user before implementation as a
+  genuine design choice, not an obvious default.
+- **Decision — `CallerInfo.caller_symbol` strips any `chunker.fallback
+  .split_oversized_symbol`-applied `#partN` suffix (regex `r"#part\d+$"`,
+  extracted into the new shared `impact/symbols.py`), and is `None`
+  (never `""`) for a call site inside a whole-file-fallback chunk
+  (`symbol == ""`, `type == SymbolKind.MODULE`) or when no containing
+  chunk spans the reference line at all.** The raw `#partN` suffix is an
+  internal chunk-storage artifact that must never leak into an
+  externally-facing report; `None` represents "no enclosing symbol to
+  name" as a real, distinct case rather than a misleading empty string.
+  `file`/`line` on `CallerInfo`/`ImporterInfo` stay exact regardless —
+  only the derived `caller_symbol` display value is cleaned up.
+- **Decision — `_match_symbol`'s exact + qualified-suffix matching logic
+  extracted once into `impact/symbols.py:match_symbol_chunks`, with
+  `mcp/server.py:_match_symbol` reduced to a thin wrapper.** Both
+  `find_symbol` and `analyze_impact` now call the same implementation —
+  verified byte-for-byte identical `find_symbol` test output before and
+  after the extraction (no behavior change, pure refactor). The same
+  module also gained `count_distinct_definitions` (how many distinct
+  `(file, unsuffixed-qualified-symbol)` definitions repo-wide share a
+  bare trailing name) — the mechanism behind CONFIRMED (`<= 1`) vs LIKELY
+  (`> 1`) caller-confidence labeling. Name-based matching, not full
+  type/scope resolution, is an explicitly accepted V2 simplification
+  (CLAUDE.md rules out "perfect whole-program static analysis"); this
+  labeling exists precisely to keep that limitation visible rather than
+  overstating precision.
+- **Decision — import resolution (`impact/analyzer.py:_resolves_to`)
+  tries a full repo-relative path candidate FIRST, falling back to a
+  bare-basename comparison only when no concrete full-path candidate
+  could be built at all (a bare token specifier, e.g. Python `import os`
+  or an npm package name).** A concrete-but-non-matching full-path
+  candidate is a **definitive rejection**, never a trigger for the
+  basename fallback — verified against a real false positive this exact
+  ordering prevents: two same-named files in different packages
+  (`pkg_a/auth.py` vs `pkg_b/auth.py`) must not cross-match. A
+  basename-only match still stays `LIKELY`, never promoted to
+  `CONFIRMED`. **Bug found and fixed during this day's own manual
+  end-to-end verification** (run against the real `p-queue` demo repo,
+  not just unit fixtures): a relative specifier's extension (e.g.
+  `import PQueue from "../source/index.js"`, TS/ESM's common
+  compiled-`.js`-from-`.ts`-source convention) was not being stripped
+  before comparison against the already-extension-stripped target file,
+  so a real, correct import was silently missed. Fixed by extension-
+  stripping every relative/slash-containing candidate in
+  `_module_to_candidate_paths` before it's ever compared; added as a
+  regression test (`test_analyze_impact_import_resolution_strips_js_extension_from_relative_specifier`)
+  since no unit fixture had originally exercised an extensioned relative
+  specifier.
+- **Decision — `is_likely_test` (`impact/analyzer.py`) matches on path
+  segments (`PurePosixPath(file).parts[:-1]`, case-insensitive
+  `"test"`/`"tests"`) or a filename regex (`test_*.py` / `*_test.py` /
+  `*.test.ts` / `*.spec.ts`), never a bare substring search.** This is
+  what keeps `contest.py`/`latest_config.py` from being misflagged —
+  verified both directions with dedicated tests, and confirmed correct
+  against the real p-queue repo (every real caller under `test/` flagged
+  `is_likely_test=True`).
+- **Decision — `callers`/`importers` are each capped at
+  `MAX_IMPACT_REFERENCES_PER_KIND = 50`** (a module-level `Final[int]` in
+  `impact/analyzer.py`, same locally-scoped-constant convention
+  `chunker/fallback.py`'s `DEFAULT_MAX_CHUNK_LINES` already set, not a
+  new `config.py` entry), **with a `callers_truncated`/`importers_truncated`
+  flag set whenever the real count exceeds the cap** — a very common bare
+  name (`run`, `close`, `get`) must never return an unbounded list, and a
+  capped list must never be presented as if it were exhaustive (the LLM
+  narration step is explicitly told when truncation occurred and
+  instructed not to imply completeness).
+- **Decision — `analyze_impact` degrades gracefully to `explanation=None`
+  when every configured LLM provider fails or none is configured, rather
+  than failing the whole tool call.** `impact/analyzer.py` catches
+  `NoProviderConfiguredError`/`AllProvidersFailedError` from
+  `impact.explain.explain_impact` and returns the full `ImpactResult`
+  with all deterministic evidence intact. This is a deliberate,
+  user-confirmed divergence from `ask`'s existing hard-fail-on-no-provider
+  behavior (D-023) — `ask` has nothing useful to return without an LLM;
+  `analyze_impact`'s deterministic evidence (defs/callers/importers) is
+  real, already-computed value that an LLM outage shouldn't discard.
+  Observed live during manual verification against p-queue: the
+  repo's real (but non-functional, 404-ing) `GROQ_API_KEY` caused
+  `explain_impact` to genuinely exhaust its provider chain, and
+  `analyze_impact` correctly returned full evidence with
+  `explanation=None` rather than erroring the whole call.
+- **Decision — `explain_impact` (`impact/explain.py`) duplicates
+  `generation.pipeline`'s `_extract_json_object`/`_build_retry_prompt`
+  helpers locally rather than importing them (they're private,
+  leading-underscore, module-internal there)** — matches this codebase's
+  existing per-stage-duplication convention (no shared `conftest.py`
+  either, same spirit). Anti-fabrication is enforced mechanically, not
+  just prompt-requested: a `referenced_files` entry absent from the real
+  evidence-file set is treated as a retry-worthy failure exactly like a
+  JSON-shape validation error, with a corrective retry prompt naming the
+  fabricated file(s) — `explain_impact` either returns a fully-verified
+  narrative or raises, never a narrative built from a fabrication.
+- **Decision — a real circular import was discovered and fixed while
+  wiring `mcp/server.py` to `impact.analyzer`.** `codebase_rag_mcp/mcp/
+  __init__.py` eagerly imported `mcp.server` (to re-export `run`) — but
+  Python always executes a package's `__init__.py` before any of its
+  submodules, so the moment `impact/models.py` needed `mcp.models
+  .SearchHit`, importing `codebase_rag_mcp.mcp.models` transitively
+  forced `mcp/__init__.py` to load `mcp.server`, which now imports
+  `impact.analyzer` — a genuine cycle. Fixed by removing `mcp/__init__.py`'s
+  eager `run` re-export entirely (it now carries no imports, doc-only);
+  `cli/main.py`'s lazy `serve` import was changed to `from codebase_rag_mcp
+  .mcp.server import run` directly. No other caller depended on the old
+  `from codebase_rag_mcp.mcp import run` path.
+- **Consequences:** `find_symbol`'s docstring and `mcp/server.py`'s
+  module docstring no longer say "reference tracking is Day 10 scope" /
+  "four tools" — both are stale phrasing this day retires.
+  `repository_summary` (V2) remains unbuilt, Day 11 scope. Full-path
+  import resolution's own limitations (name-based, not a real module
+  resolver) mean a sufficiently unusual monorepo/path-alias setup can
+  still miss or misattribute an importer — accepted, named V2 scope, not
+  revisited here.

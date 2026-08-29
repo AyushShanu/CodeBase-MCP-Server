@@ -31,7 +31,13 @@ from tree_sitter import Node
 
 from codebase_rag_mcp.parser.exceptions import ParseError
 from codebase_rag_mcp.parser.grammars import get_cached_parser, resolve_grammar_name
-from codebase_rag_mcp.parser.models import ParsedSymbol, ParseResult, SymbolKind
+from codebase_rag_mcp.parser.models import (
+    ParsedSymbol,
+    ParseResult,
+    RawReference,
+    ReferenceKind,
+    SymbolKind,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +79,28 @@ def parse_file(path: Path, language: str, source: bytes) -> ParseResult:
             parse_errors.append(msg)
             logger.warning(msg)
 
+    # Second, independent walk over the SAME already-parsed tree -- no
+    # second parser.parse() call. Deliberately a full-tree recursive walk
+    # (unlike the symbol walk above, which stops at nested function/class
+    # boundaries by design) since calls happen inside function bodies the
+    # symbol walk never descends into. A distinct log-message prefix keeps
+    # the two failure modes distinguishable in parse_errors/logs.
+    references: list[RawReference] = []
+    extract_refs = _REFERENCE_EXTRACTORS.get(grammar_name)
+    if extract_refs is not None:
+        try:
+            extract_refs(tree.root_node, references)
+        except Exception as exc:
+            msg = f"{path}: reference extraction error: {exc}"
+            parse_errors.append(msg)
+            logger.warning(msg)
+
     return ParseResult(
-        path=path.as_posix(), language=language, symbols=symbols, parse_errors=parse_errors
+        path=path.as_posix(),
+        language=language,
+        symbols=symbols,
+        parse_errors=parse_errors,
+        references=references,
     )
 
 
@@ -229,6 +255,191 @@ _EXTRACTORS: dict[str, Callable[[Node, list[ParsedSymbol]], None]] = {
     "tsx": _extract_ts_js,
     "javascript": _extract_ts_js,
     "python": _extract_python,
+}
+
+
+# --- reference extraction (calls + imports) ---------------------------------- #
+#
+# A second, independent walk per language family, run against the same
+# already-parsed tree `parse_file` already has -- never a second
+# `parser.parse(source)` call. Unlike `_dispatch_ts_js`/`_dispatch_python`
+# above (a targeted, stop-early walk that deliberately never recurses into
+# function/method bodies, keeping nested helpers/callbacks out of the
+# *symbol* list), every function below recurses into EVERY named child
+# unconditionally -- calls happen inside function bodies, so the reference
+# walk needs the opposite recursion policy. Node/field shapes below were
+# empirically verified against this repo's installed
+# `tree_sitter_language_pack` (Python 3.14, tree-sitter>=0.23,<0.26) before
+# writing this -- re-verify if the pinned grammar version ever changes.
+
+
+def _text(node: Node) -> str:
+    return node.text.decode("utf-8") if node.text is not None else ""
+
+
+# --- TypeScript / TSX / JavaScript reference walk ---------------------------- #
+
+
+def _extract_references_ts_js(root: Node, refs: list[RawReference]) -> None:
+    _walk_ts_js_references(root, refs)
+
+
+def _walk_ts_js_references(node: Node, refs: list[RawReference]) -> None:
+    if node.type == "call_expression":
+        ref = _ts_js_call_reference(node)
+        if ref is not None:
+            refs.append(ref)
+    elif node.type == "import_statement":
+        ref = _ts_js_import_reference(node)
+        if ref is not None:
+            refs.append(ref)
+    for child in node.named_children:
+        _walk_ts_js_references(child, refs)
+
+
+def _ts_js_call_reference(node: Node) -> RawReference | None:
+    # `new Widget()` is a separate node type (`new_expression`), never
+    # `call_expression` -- deliberately not captured here.
+    func = node.child_by_field_name("function")
+    if func is None:
+        return None
+    if func.type == "identifier":
+        name = _text(func)
+    elif func.type == "member_expression":
+        # `obj.method()`/`a.b.c()` -- the grammar already isolates the
+        # trailing component via the "property" field, no manual
+        # chain-walking needed.
+        prop = func.child_by_field_name("property")
+        if prop is None or prop.text is None:
+            return None
+        name = _text(prop)
+    else:
+        # e.g. `foo()()` or a subscript-called value -- unrecognized
+        # callee shape, never raises, just skipped.
+        return None
+    if not name:
+        return None
+    return RawReference(name=name, kind=ReferenceKind.CALL, line=node.start_point.row + 1)
+
+
+def _ts_js_import_reference(node: Node) -> RawReference | None:
+    source = node.child_by_field_name("source")
+    if source is None:
+        return None
+    module = _string_literal_text(source)
+    if not module:
+        return None
+    name = module.rstrip("/").rsplit("/", 1)[-1]
+    return RawReference(
+        name=name, kind=ReferenceKind.IMPORT, line=node.start_point.row + 1, module=module
+    )
+
+
+def _string_literal_text(string_node: Node) -> str | None:
+    for child in string_node.named_children:
+        if child.type == "string_fragment" and child.text is not None:
+            return _text(child)
+    if string_node.text is None:
+        return None
+    raw = _text(string_node)
+    if len(raw) >= 2 and raw[0] in "'\"`":
+        return raw[1:-1]
+    return raw or None
+
+
+# --- Python reference walk ----------------------------------------------- #
+
+
+def _extract_references_python(root: Node, refs: list[RawReference]) -> None:
+    _walk_python_references(root, refs)
+
+
+def _walk_python_references(node: Node, refs: list[RawReference]) -> None:
+    if node.type == "call":
+        ref = _python_call_reference(node)
+        if ref is not None:
+            refs.append(ref)
+    elif node.type == "import_statement":
+        refs.extend(_python_import_statement_references(node))
+    elif node.type == "import_from_statement":
+        ref = _python_import_from_reference(node)
+        if ref is not None:
+            refs.append(ref)
+    for child in node.named_children:
+        _walk_python_references(child, refs)
+
+
+def _python_call_reference(node: Node) -> RawReference | None:
+    func = node.child_by_field_name("function")
+    if func is None:
+        return None
+    if func.type == "identifier":
+        name = _text(func)
+    elif func.type == "attribute":
+        # `obj.method()`/`a.b.c()` -- the grammar already isolates the
+        # trailing component via the "attribute" field.
+        attr = func.child_by_field_name("attribute")
+        if attr is None or attr.text is None:
+            return None
+        name = _text(attr)
+    else:
+        # e.g. `handlers[key]()` (a subscript callee) -- unrecognized
+        # shape, never raises, just skipped.
+        return None
+    if not name:
+        return None
+    return RawReference(name=name, kind=ReferenceKind.CALL, line=node.start_point.row + 1)
+
+
+def _python_import_statement_references(node: Node) -> list[RawReference]:
+    # `import a, b.c, d as e` -- one RawReference per distinct module
+    # named (each is a genuinely different module, unlike
+    # import_from_statement's single shared source below).
+    out: list[RawReference] = []
+    line = node.start_point.row + 1
+    for child in node.children_by_field_name("name"):
+        module_node = child.child_by_field_name("name") if child.type == "aliased_import" else child
+        if module_node is None or module_node.text is None:
+            continue
+        module = _text(module_node)
+        if not module:
+            continue
+        out.append(
+            RawReference(
+                name=module.rsplit(".", 1)[-1], kind=ReferenceKind.IMPORT, line=line, module=module
+            )
+        )
+    return out
+
+
+def _python_import_from_reference(node: Node) -> RawReference | None:
+    # `from a.b import c, d as e` -- ONE reference for the whole
+    # statement; every imported name shares the same source module,
+    # which is all impact.analyzer's import resolution needs
+    # (module-path resolution, never per-imported-name resolution).
+    # `from . import x`'s module_name field is present but has type
+    # `relative_import` (text "."), not `dotted_name` -- decoded as-is
+    # rather than specially resolved, a deliberate, accepted V2 gap (a
+    # "." module never matches anything meaningful during resolution).
+    module_node = node.child_by_field_name("module_name")
+    if module_node is None or module_node.text is None:
+        return None
+    module = _text(module_node)
+    if not module:
+        return None
+    return RawReference(
+        name=module.rsplit(".", 1)[-1],
+        kind=ReferenceKind.IMPORT,
+        line=node.start_point.row + 1,
+        module=module,
+    )
+
+
+_REFERENCE_EXTRACTORS: dict[str, Callable[[Node, list[RawReference]], None]] = {
+    "typescript": _extract_references_ts_js,
+    "tsx": _extract_references_ts_js,
+    "javascript": _extract_references_ts_js,
+    "python": _extract_references_python,
 }
 
 

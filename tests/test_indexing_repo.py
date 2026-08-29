@@ -11,12 +11,13 @@ import pytest
 
 from codebase_rag_mcp.chunker.chunker import chunk_file
 from codebase_rag_mcp.chunker.models import Chunk
-from codebase_rag_mcp.indexing import repo
+from codebase_rag_mcp.indexing import references, repo
 from codebase_rag_mcp.indexing.manifest import load_manifest
 from codebase_rag_mcp.indexing.models import Bm25IndexStats, VectorIndexStats
 from codebase_rag_mcp.indexing.repo import build_all_indexes, collect_repo_chunks
 from codebase_rag_mcp.ingestion.scanner import scan
 from codebase_rag_mcp.parser.extractor import parse_file
+from codebase_rag_mcp.parser.models import ReferenceKind
 
 _PY_SOURCE = b"""\
 def foo():
@@ -110,6 +111,28 @@ def test_collect_repo_chunks_skips_excluded_files(tmp_path: Path) -> None:
 
     assert not result.read_failures
     assert {c.file for c in result.chunks} == {"a.py"}
+
+
+def test_collect_repo_chunks_also_collects_file_references(tmp_path: Path) -> None:
+    source = b"""\
+import os
+
+
+def caller():
+    helper()
+"""
+    _write(tmp_path / "a.py", source)
+    stats = scan(tmp_path)
+
+    result = collect_repo_chunks(tmp_path, stats)
+
+    assert {(r.file, r.name, r.kind) for r in result.references} == {
+        ("a.py", "os", ReferenceKind.IMPORT),
+        ("a.py", "helper", ReferenceKind.CALL),
+    }
+    # references.file must always agree with the chunks' own .file for the
+    # same source file (both derive from parse_result.path).
+    assert {c.file for c in result.chunks} == {r.file for r in result.references}
 
 
 # --- build_all_indexes --------------------------------------------------------- #
@@ -240,3 +263,18 @@ def test_build_all_indexes_manifest_repo_root_matches_the_scanned_root(
     manifest = load_manifest(index_dir)
     assert manifest is not None
     assert manifest.repo_root == str(checkout.resolve())
+
+
+def test_build_all_indexes_also_persists_references_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(tmp_path / "a.py", b"import os\n\n\ndef caller():\n    helper()\n")
+    monkeypatch.setattr(repo.vector, "build_index", _FakeStats.fake_vector_build_index)
+    monkeypatch.setattr(repo.bm25, "build_index", _FakeStats.fake_bm25_build_index)
+    index_dir = tmp_path / "idx"
+
+    build_all_indexes(tmp_path, index_dir=index_dir)
+
+    reference_index = references.load_index(index_dir=index_dir)
+    assert reference_index is not None
+    assert reference_index.size == 2

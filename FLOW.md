@@ -15,16 +15,18 @@ flowchart LR
 
     subgraph Server[codebase-rag-mcp server]
         MCP[MCP stdio layer<br/>mcp/server.py]
-        TOOLS[Tool handlers<br/>search_code · find_symbol · get_file_context · ask]
+        TOOLS[Tool handlers<br/>search_code · find_symbol · get_file_context · ask · analyze_impact]
         RETRIEVAL[Retrieval]
         RERANKER[Reranker]
         GEN[Generation]
+        IMPACT[Impact analysis<br/>impact/analyzer.py]
     end
 
     subgraph Indexes[Persisted indexes]
         FAISS[(FAISS vector index)]
         BM25[(BM25 sparse index)]
         META[(Chunk metadata store)]
+        REFS[(Reference/import index)]
     end
 
     subgraph Providers[LLM providers]
@@ -48,6 +50,9 @@ flowchart LR
     GEN --> OR
     GEN --> GEM
     GEN --> LOCAL
+    TOOLS --> IMPACT
+    IMPACT --> REFS
+    IMPACT --> GEN
 ```
 
 ---
@@ -117,6 +122,22 @@ corpus and persisted as a pickle (`bm25.pkl`, since `BM25Okapi` has no
 native serialization) alongside a JSON chunk-metadata sidecar
 (`bm25_metadata.json`), mirroring the vector index's binary+JSON split.
 
+Reference indexing (`indexing/references.py:build_index`/`write_index`,
+Day 10) is a parallel, sibling path fed by the *same* per-file
+`parser.extractor.parse_file` call `collect_repo_chunks` already makes —
+`parse_file` now also runs a second, full-tree Tree-sitter walk (opposite
+recursion policy from the symbol walk: it descends into every function/
+method body, since that's where calls happen) to produce
+`ParseResult.references: list[RawReference]` (call sites + import
+statements), which `collect_repo_chunks` tags with the originating file
+into `RepoChunkCollection.references: list[FileReference]` alongside
+`.chunks`. `indexing.repo.build_all_indexes` then groups that list into a
+`ReferenceIndex` (a plain in-memory lookup, not a model — `by_name` for
+call-site lookup, `imports` for import-statement lookup) and persists it
+as plain JSON (`references.json`, no pickle needed) — no re-walk of the
+repo, since `collect_repo_chunks` already produced everything needed in
+its one pass.
+
 ```mermaid
 flowchart TD
     A[Target: https:// GitHub URL or local path] --> B1[ingestion.loader<br/>load_repo]
@@ -137,8 +158,10 @@ flowchart TD
     D1 --> D3[indexing.repo<br/>collect_repo_chunks: loop over RepoStats]
     D3 --> E[indexing.vector<br/>embed_chunks -> build_index<br/>all-MiniLM-L6-v2, batched + L2-normalized]
     D3 --> F[indexing.bm25<br/>tokenize -> BM25Okapi build_index]
+    D3 --> I[indexing.references<br/>build_index -> write_index<br/>grouped by_name / imports lookup]
     E --> G[("data/index/<br/>vector.faiss + vector_metadata.json")]
     F --> H[("data/index/<br/>bm25.pkl + bm25_metadata.json")]
+    I --> J[("data/index/<br/>references.json")]
 ```
 
 `parse_file`/`chunk_file` are exercised directly by
@@ -149,19 +172,31 @@ a fresh process can `load_index(index_dir=...)` against `G` and query it
 with no rebuild. `F`/`H` (BM25) are implemented and tested as of Day 05
 (`tests/test_indexing_bm25.py`), reached via
 `indexing.repo.build_all_indexes` which calls `collect_repo_chunks` exactly
-once and builds `E` and `F` from the identical chunk list (D-020).
+once and builds `E` and `F` from the identical chunk list (D-020). `I`/`J`
+(the reference/import index) are implemented and tested as of Day 10
+(`tests/test_indexing_references.py`), reached via the same
+`build_all_indexes` call — `references.json`'s absence is lenient (a
+fresh `ReferenceIndex | None` load returns `None`, not an error; see
+D-024), unlike `E`/`G` and `F`/`H`'s strict "must be built first" contract.
 
 ---
 
 ## 3. Online query flow
 
-The MCP server (`mcp/server.py`, Day 08) owns four tools. `search_code`,
-`find_symbol`, and `get_file_context` return raw evidence; only `ask` calls
-`generate_answer`. All four read cached state (`vector_index`, `bm25_index`,
-one `CrossEncoder`, one embedding-model instance) loaded/constructed exactly
-once at server startup via `lifespan` — see D-023 — never reconstructed
-per call, and never touched without holding `_ServerState.lock` for the
-two calls that actually use it (`hybrid_search`/`rerank`).
+The MCP server (`mcp/server.py`, Day 08 + Day 10's `analyze_impact`) owns
+five tools. `search_code`, `find_symbol`, and `get_file_context` return
+raw evidence; `ask` calls `generate_answer`; `analyze_impact` calls
+`impact.analyzer.analyze_impact`, which itself may call `generate_answer`'s
+sibling `impact.explain.explain_impact`. All five read cached state
+(`vector_index`, `bm25_index`, one `CrossEncoder`, one embedding-model
+instance, and — Day 10 — an optional `reference_index`) loaded/constructed
+exactly once at server startup via `lifespan` — see D-023/D-024 — never
+reconstructed per call, and never touched without holding
+`_ServerState.lock` for the calls that actually use it
+(`hybrid_search`/`rerank`, and `analyze_impact`'s own `.chunks` read).
+`reference_index` is the one piece of that cached state loaded leniently —
+its absence (or corruption, logged at startup) never blocks the server
+from starting, unlike `vector_index`+`bm25_index` both being absent.
 
 **`ask` tool:**
 
@@ -279,8 +314,12 @@ they return raw evidence only:
   retrieval/reranking at all) and does an exact-or-qualified-suffix match
   on `chunk.symbol` (D-013's `ClassName.method` naming) — `score=1.0`
   exact, `score=0.5` suffix, a match-quality indicator, not a retrieval
-  score. Definitions only; no usages/callers until Day 10's
-  `analyze_impact`. Zero matches is a normal empty result, never an error.
+  score. Definitions only; see `analyze_impact` below for usages/callers.
+  Zero matches is a normal empty result, never an error. This matching
+  logic (Day 10) now lives in the shared `impact.symbols.match_symbol_chunks`,
+  with `_match_symbol` reduced to a thin `Chunk`→`SearchHit` wrapper
+  around it (D-024) — `find_symbol` and `analyze_impact` share exactly
+  one implementation.
 - `get_file_context(file, start_line, end_line)`: resolves `file` against
   the per-index manifest's `repo_root` (`indexing.manifest`, D-023),
   verifies containment (mirrors `ingestion.scanner.scan`'s resolve-then-
@@ -288,6 +327,62 @@ they return raw evidence only:
   exact requested line range directly from disk — never reconstructed from
   indexed chunk content. Works for any real file under `repo_root`, not
   only indexed ones (a named V1 limitation, see D-023).
+
+**`analyze_impact` tool (Day 10, `tests/test_mcp_server.py`,
+`tests/test_impact.py`):**
+
+```mermaid
+sequenceDiagram
+    participant U as User (via MCP client)
+    participant M as MCP server
+    participant S as impact.symbols
+    participant A as impact.analyzer
+    participant R as reference_index
+    participant X as impact.explain
+    participant P as Provider chain
+
+    U->>M: tools/call { name: "analyze_impact", arguments: {symbol} }
+    M-->>M: read state.vector_index/bm25_index.chunks under state.lock
+    M->>A: analyze_impact(symbol, chunks, state.reference_index)
+    A->>S: match_symbol_chunks(symbol, chunks) -- exact + qualified-suffix
+    alt zero definitions found
+        A-->>M: ImpactResult(has_evidence=False, explanation=None) -- no reference_index access, no LLM call at all
+    else at least one definition found
+        A-->>A: build definitions: list[SearchHit] (score 1.0 exact / 0.5 suffix)
+        alt reference_index is None
+            A-->>A: callers=[] importers=[] (index absent -- degrade, don't error)
+        else reference_index present
+            A->>R: by_name(symbol), kind==CALL -- direct callers
+            A-->>A: count_distinct_definitions(bare_trailing_name) -> CONFIRMED (<=1) vs LIKELY (>1)
+            A-->>A: resolve each caller's containing chunk -> caller_symbol (#partN-stripped, None for whole-file-fallback/no-containing-chunk)
+            A-->>A: is_likely_test(file) path-segment/filename heuristic
+            A->>R: imports -- IMPORT-kind entries
+            A-->>A: _resolves_to: full-path candidate first, basename fallback only if none buildable -- all importers LIKELY
+            A-->>A: cap callers/importers at MAX_IMPACT_REFERENCES_PER_KIND, set *_truncated flags
+        end
+        A->>X: explain_impact(symbol, partial_result) -- only once real evidence exists
+        X->>P: select_providers() -- same NVIDIA -> Groq -> OpenRouter -> Gemini -> Local chain as ask
+        X-->>X: extract-JSON-then-validate loop (generation.pipeline's pattern, duplicated locally)
+        X-->>X: reject any referenced_files entry absent from real evidence -- retry, same as a JSON-validation failure
+        alt every provider fails or none configured
+            X-->>A: raises NoProviderConfiguredError / AllProvidersFailedError
+            A-->>A: catch, log warning, explanation=None -- deterministic evidence still returned (D-024, diverges from ask's hard-fail)
+        else a provider succeeds
+            X-->>A: verified narrative string
+        end
+        A-->>M: ImpactResult(has_evidence=True, ...)
+    end
+    M-->>U: ImpactResult
+```
+
+Unlike `search_code`/`ask`, only the `chunks` read happens under
+`state.lock` — the deterministic-evidence assembly and the LLM call both
+run outside it, mirroring `ask`'s own `generate_answer` call (a network
+call must never block `search_code`/`find_symbol`). See D-024 for the
+full design rationale, including the empirically-verified Tree-sitter
+node types the reference scanner relies on and the real false-positive
+bug (a `.js`-extensioned relative TS import) found and fixed during this
+day's own manual verification against the real `p-queue` demo repo.
 
 ---
 
@@ -362,6 +457,7 @@ configured provider.
 | Chunks        | Memory only (aggregated by `indexing.repo.collect_repo_chunks`) | `chunker/`, `indexing/repo.py` |
 | Vector index  | `INDEX_DIR/vector.faiss` + `INDEX_DIR/vector_metadata.json` | `indexing/vector.py` |
 | BM25 index    | `INDEX_DIR/bm25.pkl` + `INDEX_DIR/bm25_metadata.json` | `indexing/bm25.py`   |
+| Reference index | `INDEX_DIR/references.json` (plain JSON, absence is lenient) | `indexing/references.py` |
 | Manifest      | `INDEX_DIR/manifest.json` (repo_root, source)          | `indexing/manifest.py` |
 | Logs          | stderr / `LOG_LEVEL`                   | `cli`, `mcp`     |
 | Caches        | `.cache/`, `.mypy_cache/`, `.ruff_cache/` (gitignored) | tooling  |

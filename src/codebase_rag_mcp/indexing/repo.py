@@ -13,10 +13,11 @@ from pathlib import Path
 from codebase_rag_mcp.chunker.chunker import chunk_file
 from codebase_rag_mcp.chunker.models import Chunk
 from codebase_rag_mcp.config import EMBEDDING_BATCH_SIZE, EMBEDDING_MODEL_NAME, INDEX_DIR
-from codebase_rag_mcp.indexing import bm25, manifest, vector
+from codebase_rag_mcp.indexing import bm25, manifest, references, vector
 from codebase_rag_mcp.indexing.models import (
     Bm25IndexStats,
     FileReadFailure,
+    FileReference,
     RepoChunkCollection,
     VectorIndexStats,
 )
@@ -52,6 +53,7 @@ def collect_repo_chunks(root: Path, stats: RepoStats, *, repo: str = "") -> Repo
     """
     chunks: list[Chunk] = []
     failures: list[FileReadFailure] = []
+    file_references: list[FileReference] = []
 
     for record in stats.files:
         if not record.included:
@@ -77,8 +79,12 @@ def collect_repo_chunks(root: Path, stats: RepoStats, *, repo: str = "") -> Repo
             continue
 
         chunks.extend(chunk_file(parse_result, source, repo=repo))
+        file_references.extend(
+            FileReference(file=parse_result.path, name=r.name, kind=r.kind, line=r.line, module=r.module)
+            for r in parse_result.references
+        )
 
-    return RepoChunkCollection(chunks=chunks, read_failures=failures)
+    return RepoChunkCollection(chunks=chunks, read_failures=failures, references=file_references)
 
 
 def build_all_indexes(
@@ -96,6 +102,12 @@ def build_all_indexes(
     values on both indexes": `collect_repo_chunks` is called exactly once
     here, so there is no path in this codebase where the two index builds
     can independently observe a repo that changed between them.
+
+    Also builds+persists the repo-wide reference/import index
+    (`indexing.references.build_index`/`write_index`, Day 10) from the
+    same `result.references` -- a side effect, like the manifest write
+    below, not part of the return tuple, so this function's return shape
+    stays unchanged for existing callers.
 
     Also writes `indexing.manifest.write_manifest(index_dir, repo_root=root,
     source=repo)` immediately after both indexes build successfully --
@@ -115,6 +127,8 @@ def build_all_indexes(
         batch_size=vector_batch_size,
     )
     bm25_stats = bm25.build_index(result.chunks, index_dir=index_dir)
+    reference_index = references.build_index(result.references)
+    references.write_index(reference_index, index_dir=index_dir)
     manifest.write_manifest(index_dir, repo_root=root, source=repo)
     return vector_stats, bm25_stats
 

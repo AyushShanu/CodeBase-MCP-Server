@@ -72,7 +72,10 @@ from codebase_rag_mcp import __version__ as _VERSION  # noqa: E402, N812
 from codebase_rag_mcp.chunker.models import Chunk  # noqa: E402
 from codebase_rag_mcp.generation.models import GeneratedAnswer  # noqa: E402
 from codebase_rag_mcp.generation.pipeline import generate_answer  # noqa: E402
-from codebase_rag_mcp.indexing import bm25, manifest, vector  # noqa: E402
+from codebase_rag_mcp.impact.analyzer import analyze_impact as compute_impact  # noqa: E402
+from codebase_rag_mcp.impact.models import ImpactResult  # noqa: E402
+from codebase_rag_mcp.impact.symbols import match_symbol_chunks  # noqa: E402
+from codebase_rag_mcp.indexing import bm25, manifest, references, vector  # noqa: E402
 from codebase_rag_mcp.indexing.bm25 import Bm25Index  # noqa: E402
 from codebase_rag_mcp.indexing.exceptions import (  # noqa: E402
     Bm25LoadError,
@@ -81,8 +84,10 @@ from codebase_rag_mcp.indexing.exceptions import (  # noqa: E402
     EmptyIndexError,
     IndexLoadError,
     IndexNotBuiltError,
+    ReferenceIndexLoadError,
 )
 from codebase_rag_mcp.indexing.manifest import IndexManifest  # noqa: E402
+from codebase_rag_mcp.indexing.references import ReferenceIndex  # noqa: E402
 from codebase_rag_mcp.indexing.vector import VectorIndex  # noqa: E402
 from codebase_rag_mcp.mcp.exceptions import (  # noqa: E402
     IndexNotAvailableError,
@@ -121,6 +126,13 @@ class _ServerState:
 
     `embeddings` is `None` when `vector_index` is `None` -- there is
     nothing to embed a query against, so no point constructing the model.
+
+    `reference_index` is loaded leniently (Day 10): its absence never
+    blocks server startup, unlike `vector_index`+`bm25_index` both being
+    `None`, which does raise `IndexNotAvailableError` -- `analyze_impact`
+    simply degrades to "definitions only, no callers/importers" when it
+    is `None`, the same way every other tool works fine without a
+    manifest.
     """
 
     vector_index: VectorIndex | None
@@ -128,6 +140,7 @@ class _ServerState:
     cross_encoder: CrossEncoder
     embeddings: HuggingFaceEmbeddings | None
     manifest: IndexManifest | None
+    reference_index: ReferenceIndex | None
     lock: asyncio.Lock
 
 
@@ -173,19 +186,27 @@ def _make_lifespan(
         )
         loaded_manifest = manifest.load_manifest(index_dir)
 
+        loaded_reference_index: ReferenceIndex | None = None
+        try:
+            loaded_reference_index = references.load_index(index_dir=index_dir)
+        except ReferenceIndexLoadError as exc:
+            logger.warning("reference index unavailable/corrupt under %s: %s", index_dir, exc)
+
         state = _ServerState(
             vector_index=vector_index,
             bm25_index=bm25_index,
             cross_encoder=cross_encoder,
             embeddings=embeddings,
             manifest=loaded_manifest,
+            reference_index=loaded_reference_index,
             lock=asyncio.Lock(),
         )
         logger.info(
-            "codebase-rag-mcp ready: vector=%s bm25=%s manifest=%s",
+            "codebase-rag-mcp ready: vector=%s bm25=%s manifest=%s references=%s",
             vector_index is not None,
             bm25_index is not None,
             loaded_manifest is not None,
+            loaded_reference_index is not None,
         )
         yield state
 
@@ -220,17 +241,14 @@ def _match_symbol(symbol: str, chunks: list[Chunk]) -> list[SearchHit]:
     deterministic lookup with no ranking model involved. Exact matches
     always sort first; both groups sort by `(file, start_line)` within
     themselves for stable output.
+
+    Thin wrapper (Day 10) around `impact.symbols.match_symbol_chunks` --
+    the actual matching logic now lives there so `analyze_impact` reuses
+    exactly this same implementation rather than a second, possibly-
+    diverging one. This function's own output (a flat `list[SearchHit]`)
+    is unchanged byte-for-byte from before that extraction.
     """
-    exact: list[Chunk] = []
-    suffix: list[Chunk] = []
-    suffix_needle = f".{symbol}"
-    for chunk in chunks:
-        if chunk.symbol == symbol:
-            exact.append(chunk)
-        elif chunk.symbol.endswith(suffix_needle):
-            suffix.append(chunk)
-    exact.sort(key=lambda c: (c.file, c.start_line))
-    suffix.sort(key=lambda c: (c.file, c.start_line))
+    exact, suffix = match_symbol_chunks(symbol, chunks)
     return [_chunk_to_search_hit(c, score=1.0) for c in exact] + [
         _chunk_to_search_hit(c, score=0.5) for c in suffix
     ]
@@ -301,7 +319,8 @@ def _build_server(
     lifespan: Callable[[MCPServer[_ServerState]], AbstractAsyncContextManager[_ServerState]]
     | None = None,
 ) -> MCPServer[_ServerState]:
-    """Construct a fresh `MCPServer` with all four V1 tools registered.
+    """Construct a fresh `MCPServer` with all five tools registered (V1's
+    four plus Day 10's `analyze_impact`).
 
     `index_dir`/`lifespan` are test seams: real callers (`run()`) use the
     defaults; tests either point `index_dir` at a `tmp_path` index (real
@@ -340,10 +359,10 @@ def _build_server(
     async def find_symbol(symbol: str, ctx: Context[_ServerState, Any]) -> FindSymbolResult:
         """Find a function/class/method/interface's definition location(s)
         by indexed symbol name. Returns definitions only -- it does not
-        resolve usages/callers/references; reference tracking is Day 10's
-        `analyze_impact` scope. A bare method name (e.g. 'pause') also
-        matches a qualified name's trailing component (e.g. 'PQueue.pause').
-        A symbol with no matches returns an empty `matches` list, not an
+        resolve usages/callers/references; see the `analyze_impact` tool
+        for that. A bare method name (e.g. 'pause') also matches a
+        qualified name's trailing component (e.g. 'PQueue.pause'). A
+        symbol with no matches returns an empty `matches` list, not an
         error."""
         state: _ServerState = ctx.request_context.lifespan_context
         async with state.lock:
@@ -353,6 +372,31 @@ def _build_server(
                 else state.bm25_index.chunks  # type: ignore[union-attr]
             )
         return FindSymbolResult(symbol=symbol, matches=_match_symbol(symbol, chunks))
+
+    @server.tool()
+    async def analyze_impact(symbol: str, ctx: Context[_ServerState, Any]) -> ImpactResult:
+        """Given a symbol name, returns its definition(s), direct callers,
+        and importing files, combining find_symbol's own exact +
+        qualified-suffix matching with a repo-wide reference index built
+        at index time. Every caller/importer is labeled CONFIRMED (an
+        unambiguous bare symbol name, repo-wide) or LIKELY (an ambiguous
+        name, or an import resolved only via a basename fallback) --
+        name-based matching, not full type/scope resolution, is an
+        explicitly accepted V2 simplification. Includes an LLM-generated
+        prose explanation only when there is at least one definition and
+        a configured LLM provider succeeded; a provider failure/absence
+        degrades `explanation` to None without failing the call -- the
+        deterministic evidence is always returned. A symbol with zero
+        definitions returns has_evidence=False and explanation=None,
+        never an error."""
+        state: _ServerState = ctx.request_context.lifespan_context
+        async with state.lock:
+            chunks = (
+                state.vector_index.chunks
+                if state.vector_index is not None
+                else state.bm25_index.chunks  # type: ignore[union-attr]
+            )
+        return compute_impact(symbol, chunks, state.reference_index)
 
     @server.tool()
     async def get_file_context(
