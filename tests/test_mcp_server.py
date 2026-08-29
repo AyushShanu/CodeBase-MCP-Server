@@ -1,4 +1,5 @@
-"""Tests for the MCP server (V1): mcp.server.server's four real tools.
+"""Tests for the MCP server: mcp.server.server's five real tools (V1's
+four plus Day 10's `analyze_impact`).
 
 Uses `mcp.client._memory.InMemoryTransport` + `mcp.client.session
 .ClientSession` -- the SDK's own in-process transport, running the real
@@ -21,10 +22,11 @@ from mcp.client.session import ClientSession
 from mcp.types import CallToolResult
 
 from codebase_rag_mcp.chunker.models import Chunk
-from codebase_rag_mcp.indexing import bm25, manifest, vector
+from codebase_rag_mcp.indexing import bm25, manifest, references, vector
+from codebase_rag_mcp.indexing.models import FileReference
 from codebase_rag_mcp.mcp import server as server_module
 from codebase_rag_mcp.mcp.server import _build_server, _make_lifespan
-from codebase_rag_mcp.parser.models import SymbolKind
+from codebase_rag_mcp.parser.models import ReferenceKind, SymbolKind
 
 
 def _chunk(
@@ -119,17 +121,24 @@ def _build_real_index(
     *,
     file_contents: dict[str, str] | None = None,
     write_manifest: bool = True,
+    file_references: list[FileReference] | None = None,
 ) -> Path:
     """Build real vector + BM25 indexes for `chunks` under `tmp_path/idx`,
     optionally writing real files under `tmp_path/repo` (`file_contents`
     maps a repo-relative path to the *whole file's* real literal text --
     deliberately independent of any individual chunk's own fragment
     `.content`, since multiple chunks commonly share one `.file`) and a
-    manifest pointing at that root. Returns the index directory.
+    manifest pointing at that root. `file_references`, when given, also
+    builds+persists a real reference index (Day 10) alongside the
+    vector/BM25 ones. Returns the index directory.
     """
     index_dir = tmp_path / "idx"
     vector.build_index(chunks, index_dir=index_dir)
     bm25.build_index(chunks, index_dir=index_dir)
+
+    if file_references is not None:
+        reference_index = references.build_index(file_references)
+        references.write_index(reference_index, index_dir=index_dir)
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir(exist_ok=True)
@@ -186,13 +195,19 @@ def _map_embeddings_for_pause_query(query: str, chunks: list[Chunk]) -> None:
 # --- tool registration -------------------------------------------------------------- #
 
 
-def test_server_advertises_exactly_the_four_v1_tools_no_ping(tmp_path: Path) -> None:
+def test_server_advertises_exactly_the_five_tools_no_ping(tmp_path: Path) -> None:
     index_dir = _build_real_index(tmp_path, _pqueue_chunks())
     server = _build_server(index_dir=index_dir)
 
     tools = asyncio.run(server.list_tools())
 
-    assert {t.name for t in tools} == {"search_code", "find_symbol", "get_file_context", "ask"}
+    assert {t.name for t in tools} == {
+        "search_code",
+        "find_symbol",
+        "get_file_context",
+        "ask",
+        "analyze_impact",
+    }
 
 
 # --- lifespan --------------------------------------------------------------------- #
@@ -270,6 +285,45 @@ def test_lifespan_manifest_is_none_when_absent(tmp_path: Path) -> None:
     asyncio.run(_run())
 
 
+def test_lifespan_loads_reference_index_when_present(tmp_path: Path) -> None:
+    file_refs = [FileReference(file="sample.py", name="pause", kind=ReferenceKind.CALL, line=5)]
+    index_dir = _build_real_index(tmp_path, _pqueue_chunks(), file_references=file_refs)
+    lifespan = _make_lifespan(index_dir=index_dir)
+    server = _build_server(index_dir=index_dir)
+
+    async def _run() -> None:
+        async with lifespan(server) as state:
+            assert state.reference_index is not None
+            assert state.reference_index.size == 1
+
+    asyncio.run(_run())
+
+
+def test_lifespan_reference_index_is_none_when_absent(tmp_path: Path) -> None:
+    index_dir = _build_real_index(tmp_path, _pqueue_chunks())
+    lifespan = _make_lifespan(index_dir=index_dir)
+    server = _build_server(index_dir=index_dir)
+
+    async def _run() -> None:
+        async with lifespan(server) as state:
+            assert state.reference_index is None
+
+    asyncio.run(_run())
+
+
+def test_lifespan_reference_index_none_on_corruption_logged_not_raised(tmp_path: Path) -> None:
+    index_dir = _build_real_index(tmp_path, _pqueue_chunks())
+    (index_dir / "references.json").write_text("not valid json", encoding="utf-8")
+    lifespan = _make_lifespan(index_dir=index_dir)
+    server = _build_server(index_dir=index_dir)
+
+    async def _run() -> None:
+        async with lifespan(server) as state:
+            assert state.reference_index is None
+
+    asyncio.run(_run())
+
+
 # --- search_code / find_symbol / get_file_context / ask (via ClientSession) --------- #
 
 
@@ -338,6 +392,57 @@ def test_find_symbol_nonexistent_symbol_returns_empty_matches_not_error(
 
     assert not result.is_error
     assert result.structured_content["matches"] == []
+
+
+def _delenv_all_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    for env_var in (
+        "NVIDIA_API_KEY",
+        "GROQ_API_KEY",
+        "OPENROUTER_API_KEY",
+        "GEMINI_API_KEY",
+        "LOCAL_MODEL_NAME",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+
+
+def test_analyze_impact_confirmed_caller_end_to_end_via_client_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _delenv_all_providers(monkeypatch)  # no provider configured -> explanation degrades to None
+    chunks = _pqueue_chunks()
+    file_refs = [
+        FileReference(file="other.py", name="pause", kind=ReferenceKind.CALL, line=7),
+    ]
+    index_dir = _build_real_index(tmp_path, chunks, file_references=file_refs)
+    server = _build_server(index_dir=index_dir)
+
+    result = asyncio.run(_call(server, "analyze_impact", {"symbol": "pause"}))
+
+    assert not result.is_error
+    content = result.structured_content
+    assert content["has_evidence"] is True
+    assert len(content["definitions"]) == 1
+    assert content["definitions"][0]["symbol"] == "PQueue.pause"
+    assert len(content["callers"]) == 1
+    assert content["callers"][0]["file"] == "other.py"
+    assert content["callers"][0]["confidence"] == "confirmed"
+    assert content["explanation"] is None
+
+
+def test_analyze_impact_zero_definitions_returns_has_evidence_false_via_client_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _delenv_all_providers(monkeypatch)
+    index_dir = _build_real_index(tmp_path, _pqueue_chunks())
+    server = _build_server(index_dir=index_dir)
+
+    result = asyncio.run(_call(server, "analyze_impact", {"symbol": "does_not_exist"}))
+
+    assert not result.is_error
+    content = result.structured_content
+    assert content["has_evidence"] is False
+    assert content["definitions"] == []
+    assert content["explanation"] is None
 
 
 def test_get_file_context_returns_exact_verbatim_lines_for_a_real_range(

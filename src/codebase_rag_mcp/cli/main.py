@@ -89,7 +89,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "serve":
         # Lazy import keeps the CLI snappy when only --version is requested.
-        from codebase_rag_mcp.mcp import run
+        # Imports mcp.server directly (not the codebase_rag_mcp.mcp package)
+        # to avoid the package __init__ eagerly loading mcp.server -- see
+        # mcp/__init__.py's own docstring for why (Day 10 impact.models ->
+        # mcp.models cross-import would otherwise cycle through it).
+        from codebase_rag_mcp.mcp.server import run
 
         run()
         return 0

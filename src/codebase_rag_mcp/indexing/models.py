@@ -10,6 +10,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field
 
 from codebase_rag_mcp.chunker.models import Chunk
+from codebase_rag_mcp.parser.models import ReferenceKind
 
 
 class FileReadFailure(BaseModel):
@@ -31,6 +32,22 @@ class FileReadFailure(BaseModel):
     reason: str
 
 
+class FileReference(BaseModel):
+    """One `parser.models.RawReference` tagged with the repo-relative file
+    it came from -- the file-tagged counterpart to `chunker.models.Chunk`
+    for the reference/import layer, mirroring `Chunk.file`'s own
+    repo-relative convention (see `indexing.repo.collect_repo_chunks`).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    file: str
+    name: str
+    kind: ReferenceKind
+    line: int
+    module: str | None = None
+
+
 class RepoChunkCollection(BaseModel):
     """Aggregated result of looping parse_file/chunk_file over a RepoStats."""
 
@@ -38,6 +55,7 @@ class RepoChunkCollection(BaseModel):
 
     chunks: list[Chunk] = Field(default_factory=list)
     read_failures: list[FileReadFailure] = Field(default_factory=list)
+    references: list[FileReference] = Field(default_factory=list)
 
 
 class SkippedChunk(BaseModel):
@@ -113,6 +131,7 @@ __all__ = [
     "Bm25IndexStats",
     "Bm25QueryResult",
     "FileReadFailure",
+    "FileReference",
     "IndexedChunk",
     "RepoChunkCollection",
     "SkippedChunk",

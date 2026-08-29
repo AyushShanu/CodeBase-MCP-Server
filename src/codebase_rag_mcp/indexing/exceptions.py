@@ -41,6 +41,16 @@ class EmptyBm25IndexError(IndexingError):
     """Raised when a build or load would leave a queryable BM25 index with zero documents."""
 
 
+class ReferenceIndexLoadError(IndexingError):
+    """Raised by `indexing.references.load_index` when `references.json`
+    exists but cannot be parsed as JSON or fails `FileReference`
+    validation. Deliberately has no sibling `ReferenceIndexNotBuiltError`
+    -- an absent reference index is a normal, lenient case (mirrors
+    `manifest.load_manifest`'s `None`-on-absence convention), not an error
+    condition; only corruption of a file that does exist is.
+    """
+
+
 __all__ = [
     "Bm25LoadError",
     "Bm25NotBuiltError",
@@ -50,4 +60,5 @@ __all__ = [
     "IndexLoadError",
     "IndexNotBuiltError",
     "IndexingError",
+    "ReferenceIndexLoadError",
 ]

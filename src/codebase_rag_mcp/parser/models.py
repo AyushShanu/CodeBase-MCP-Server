@@ -54,6 +54,42 @@ class ParsedSymbol(BaseModel):
     end_byte: int
 
 
+class ReferenceKind(StrEnum):
+    """CALL = a call-expression naming a symbol; IMPORT = an import/
+    import-from statement naming a module. Mirrors SymbolKind's "one enum
+    for what kind of thing this is" discipline.
+    """
+
+    CALL = "call"
+    IMPORT = "import"
+
+
+class RawReference(BaseModel):
+    """One extracted call site or import statement, before it is tagged
+    with its originating file (see indexing.models.FileReference for the
+    file-tagged version collected repo-wide).
+
+    `name`: for CALL, the callee's bare trailing name (matching
+    find_symbol/Chunk.symbol's bare/suffix convention -- `obj.method()`
+    records name="method", never "obj.method"). For IMPORT, the module
+    specifier's own last dotted/path segment -- used only as the
+    reference-index's grouping key; import RESOLUTION is always by
+    `module`, never by `name` (see impact.analyzer).
+    `kind`: CALL or IMPORT.
+    `line`: 1-indexed (matches ParsedSymbol.start_line's convention).
+    `module`: None for CALL. For IMPORT, the raw module specifier exactly
+    as written in source (e.g. "./mod", "foo.bar") -- never
+    resolved/normalized here; resolution happens in impact.analyzer.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    kind: ReferenceKind
+    line: int
+    module: str | None = None
+
+
 class ParseResult(BaseModel):
     """The full result of parsing one file."""
 
@@ -63,6 +99,7 @@ class ParseResult(BaseModel):
     language: str
     symbols: list[ParsedSymbol] = Field(default_factory=list)
     parse_errors: list[str] = Field(default_factory=list)
+    references: list[RawReference] = Field(default_factory=list)
 
 
-__all__ = ["ParseResult", "ParsedSymbol", "SymbolKind"]
+__all__ = ["ParseResult", "ParsedSymbol", "RawReference", "ReferenceKind", "SymbolKind"]
