@@ -127,27 +127,33 @@ def embed_chunks(
     return keep, vectors, skipped
 
 
-def build_index(
-    chunks: list[Chunk],
+def build_index_from_embeddings(
+    embedded_chunks: list[Chunk],
+    vectors: np.ndarray,
+    skipped: list[SkippedChunk],
     *,
+    chunks_requested: int,
     index_dir: str | Path = INDEX_DIR,
-    model_name: str = EMBEDDING_MODEL_NAME,
-    batch_size: int = EMBEDDING_BATCH_SIZE,
 ) -> VectorIndexStats:
-    """Embed `chunks`, build a FAISS `IndexFlatIP`, and persist it plus a
-    chunk-metadata sidecar under `index_dir` (default `config.INDEX_DIR`).
+    """FAISS structure construction + persistence ONLY -- no embedding-model
+    call of its own. `vectors[i]` must correspond to `embedded_chunks[i]`.
+
+    `build_index` calls this after its own `embed_chunks` call; the
+    incremental indexing path (`indexing.repo.build_all_indexes_incremental`)
+    calls this directly with a combined cached+freshly-embedded
+    `(chunks, vectors)` pair, skipping `embed_chunks` entirely for
+    unchanged files. `chunks_requested` is explicit (not inferred from
+    `len(embedded_chunks) + len(skipped)`) because the incremental
+    caller's "requested" count spans a cache-hit-union-cache-miss set this
+    function has no other way to know.
 
     Writes `<index_dir>/vector.faiss` (`faiss.write_index`) and
     `<index_dir>/vector_metadata.json` (a JSON array of
     `Chunk.model_dump(mode="json")`, in FAISS-add order -- vector ID `i` is
     metadata row `i`). Creates `index_dir` if needed. Raises
-    `EmptyIndexError` if every chunk is skipped and there is nothing to
-    index -- a build must fail loudly, never silently persist an empty
-    index.
+    `EmptyIndexError` if `embedded_chunks` is empty -- identical contract
+    to `build_index`.
     """
-    embedded_chunks, vectors, skipped = embed_chunks(
-        chunks, model_name=model_name, batch_size=batch_size
-    )
     if not embedded_chunks:
         raise EmptyIndexError("no chunks produced an embedding vector; nothing to index")
 
@@ -163,7 +169,7 @@ def build_index(
     (out_dir / _METADATA_FILENAME).write_text(json.dumps(metadata), encoding="utf-8")
 
     stats = VectorIndexStats(
-        chunks_requested=len(chunks),
+        chunks_requested=chunks_requested,
         chunks_embedded=len(embedded_chunks),
         chunks_skipped=len(skipped),
         skipped=skipped,
@@ -178,6 +184,34 @@ def build_index(
         stats.embedding_dimension,
     )
     return stats
+
+
+def build_index(
+    chunks: list[Chunk],
+    *,
+    index_dir: str | Path = INDEX_DIR,
+    model_name: str = EMBEDDING_MODEL_NAME,
+    batch_size: int = EMBEDDING_BATCH_SIZE,
+) -> VectorIndexStats:
+    """Embed `chunks`, build a FAISS `IndexFlatIP`, and persist it plus a
+    chunk-metadata sidecar under `index_dir` (default `config.INDEX_DIR`).
+
+    Thin wrapper: `embed_chunks` then `build_index_from_embeddings` --
+    zero behavior change from before that extraction. Raises
+    `EmptyIndexError` if every chunk is skipped and there is nothing to
+    index -- a build must fail loudly, never silently persist an empty
+    index.
+    """
+    embedded_chunks, vectors, skipped = embed_chunks(
+        chunks, model_name=model_name, batch_size=batch_size
+    )
+    return build_index_from_embeddings(
+        embedded_chunks,
+        vectors,
+        skipped,
+        chunks_requested=len(chunks),
+        index_dir=index_dir,
+    )
 
 
 class VectorIndex:
@@ -286,6 +320,7 @@ def load_index(
 __all__ = [
     "VectorIndex",
     "build_index",
+    "build_index_from_embeddings",
     "embed_chunks",
     "embed_texts",
     "load_index",

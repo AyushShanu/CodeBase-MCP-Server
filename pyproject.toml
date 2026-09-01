@@ -91,6 +91,11 @@ disallow_untyped_defs = false
 ignore_missing_imports = true
 exclude = ["tests/", "build/", "dist/"]
 mypy_path = ["src"]
+# `files` makes a bare `mypy` invocation (as CI's own workflow runs it)
+# check src/ + benchmarks/ instead of erroring out with "Missing target
+# module, package, files, or command" -- pre-existing bug, unrelated to
+# any single day's feature work, fixed here. See DECISIONS.md.
+files = ["src", "benchmarks"]
 
 [[tool.mypy.overrides]]
 module = [

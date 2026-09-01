@@ -26,6 +26,14 @@ IGNORED_DIR_NAMES: Final[frozenset[str]] = frozenset(
         ".tox",
         ".idea",
         ".vscode",
+        # This project's own default INDEX_DIR is "./data/index" -- without
+        # pruning a bare "data" directory (at any depth, like every other
+        # entry here), self-indexing this repo (or any repo that nests a
+        # prior index output under its own tree) would walk into and index
+        # stale prior output. Accepted, documented trade-off: this also
+        # excludes any third-party repo's own unrelated "data/" directory,
+        # at any depth -- see DECISIONS.md.
+        "data",
     }
 )
 
@@ -80,6 +88,18 @@ BINARY_EXTENSIONS: Final[frozenset[str]] = frozenset(
     }
 )
 
+SECRET_FILENAME_PATTERNS: Final[tuple[str, ...]] = (
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "id_rsa",
+    "id_ed25519",
+    "credentials.json",
+    "*.pfx",
+    "*.p12",
+)
+
 DEFAULT_MAX_FILE_SIZE_BYTES: Final[int] = 1_000_000  # 1 MB
 
 
@@ -96,6 +116,17 @@ def is_binary_extension(path: Path) -> bool:
     return path.suffix.lower() in BINARY_EXTENSIONS
 
 
+def is_secret_file(name: str) -> bool:
+    """Filename/path-pattern check only -- NEVER content scanning. A
+    credential hardcoded inside an ordinarily-named file (e.g. a stray API
+    key in `settings.py`) is not caught by this control, and nothing
+    should imply otherwise -- see DECISIONS.md. `id_rsa`/`id_ed25519` are
+    bare exact-match patterns (no `*`), so their `.pub` public-key
+    counterparts (safe to index) are correctly not matched.
+    """
+    return any(fnmatch.fnmatch(name, pattern) for pattern in SECRET_FILENAME_PATTERNS)
+
+
 def classify_file(
     path: Path,
     size_bytes: int,
@@ -104,11 +135,13 @@ def classify_file(
 ) -> str | None:
     """Return an exclusion reason, or None if `path` should be included.
 
-    Checked in order: lockfile > binary extension > oversized.
-    Directory-name pruning is the scanner's job (via `is_ignored_dir`,
-    applied before ever descending into a subtree) -- this function only
-    ever sees candidate *files*.
+    Checked in order: secret_file > lockfile > binary extension >
+    oversized. Directory-name pruning is the scanner's job (via
+    `is_ignored_dir`, applied before ever descending into a subtree) --
+    this function only ever sees candidate *files*.
     """
+    if is_secret_file(path.name):
+        return "secret_file"
     if is_lockfile(path.name):
         return "lockfile"
     if is_binary_extension(path):
@@ -123,8 +156,10 @@ __all__ = [
     "DEFAULT_MAX_FILE_SIZE_BYTES",
     "IGNORED_DIR_NAMES",
     "LOCKFILE_PATTERNS",
+    "SECRET_FILENAME_PATTERNS",
     "classify_file",
     "is_binary_extension",
     "is_ignored_dir",
     "is_lockfile",
+    "is_secret_file",
 ]

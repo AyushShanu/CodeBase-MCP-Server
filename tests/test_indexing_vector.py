@@ -19,7 +19,13 @@ from codebase_rag_mcp.indexing.exceptions import (
     IndexNotBuiltError,
 )
 from codebase_rag_mcp.indexing.models import SkippedChunk
-from codebase_rag_mcp.indexing.vector import build_index, embed_chunks, embed_texts, load_index
+from codebase_rag_mcp.indexing.vector import (
+    build_index,
+    build_index_from_embeddings,
+    embed_chunks,
+    embed_texts,
+    load_index,
+)
 from codebase_rag_mcp.parser.models import SymbolKind
 
 
@@ -157,6 +163,39 @@ def test_build_index_persists_faiss_and_metadata_files(tmp_path: Path) -> None:
     assert stats.chunks_skipped == 0
     assert stats.embedding_dimension == 3
     assert stats.index_size == 2
+
+
+def test_build_index_from_embeddings_persists_faiss_and_metadata_from_precomputed_vectors(
+    tmp_path: Path,
+) -> None:
+    chunks = [_chunk("a"), _chunk("b")]
+    embedded_chunks, vectors, skipped = embed_chunks(chunks)
+    index_dir = tmp_path / "idx"
+
+    stats = build_index_from_embeddings(
+        embedded_chunks, vectors, skipped, chunks_requested=len(chunks), index_dir=index_dir
+    )
+
+    assert (index_dir / "vector.faiss").exists()
+    assert (index_dir / "vector_metadata.json").exists()
+    assert stats.chunks_embedded == 2
+    assert stats.chunks_requested == 2
+    assert stats.chunks_skipped == 0
+    loaded = load_index(index_dir=index_dir)
+    assert loaded.size == 2
+
+
+def test_build_index_from_embeddings_raises_empty_index_error_when_embedded_chunks_is_empty(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(EmptyIndexError):
+        build_index_from_embeddings(
+            [],
+            np.empty((0, 0), dtype="float32"),
+            [],
+            chunks_requested=0,
+            index_dir=tmp_path / "idx",
+        )
 
 
 def test_load_index_after_build_index_returns_same_chunk_count(tmp_path: Path) -> None:

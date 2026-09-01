@@ -15,7 +15,13 @@ from codebase_rag_mcp.ingestion.exceptions import (
     RepoCloneError,
     RepoCloneTimeoutError,
 )
-from codebase_rag_mcp.ingestion.filters import DEFAULT_MAX_FILE_SIZE_BYTES, IGNORED_DIR_NAMES
+from codebase_rag_mcp.ingestion.filters import (
+    DEFAULT_MAX_FILE_SIZE_BYTES,
+    IGNORED_DIR_NAMES,
+    classify_file,
+    is_ignored_dir,
+    is_secret_file,
+)
 from codebase_rag_mcp.ingestion.loader import load_repo
 from codebase_rag_mcp.ingestion.models import RepoSourceType
 from codebase_rag_mcp.ingestion.scanner import scan
@@ -161,6 +167,57 @@ def test_scanner_excludes_ignored_dir_names(dir_name: str, tmp_path: Path) -> No
 
     paths = {f.path for f in stats.files}
     assert not any(p.startswith(f"{dir_name}/") for p in paths)
+    assert "kept.py" in paths
+
+
+# --- filters: secret files --------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "name", [".env", ".env.local", "foo.pem", "foo.key", "id_rsa", "id_ed25519", "credentials.json"]
+)
+def test_is_secret_file_matches_common_secret_filenames(name: str) -> None:
+    assert is_secret_file(name) is True
+
+
+@pytest.mark.parametrize(
+    "name", ["settings.py", "id_rsa.pub", "id_ed25519.pub", "app.env.example.md"]
+)
+def test_is_secret_file_does_not_match_ordinary_or_public_key_files(name: str) -> None:
+    assert is_secret_file(name) is False
+
+
+def test_classify_file_returns_secret_file_reason(tmp_path: Path) -> None:
+    assert classify_file(tmp_path / ".env", 10) == "secret_file"
+
+
+def test_scan_excludes_secret_files_and_records_reason(tmp_path: Path) -> None:
+    _write(tmp_path / ".env", b"SECRET=1\n")
+
+    stats = scan(tmp_path)
+
+    record = next(f for f in stats.files if f.path == ".env")
+    assert record.included is False
+    assert record.exclusion_reason == "secret_file"
+    assert stats.excluded_by_reason["secret_file"] == 1
+
+
+# --- filters: data directory -------------------------------------------------- #
+
+
+def test_is_ignored_dir_excludes_data_directory() -> None:
+    assert is_ignored_dir("data") is True
+
+
+def test_scan_prunes_data_directory_at_any_depth(tmp_path: Path) -> None:
+    _write(tmp_path / "data" / "clones" / "some.py")
+    _write(tmp_path / "src" / "data" / "nested.py")
+    _write(tmp_path / "kept.py")
+
+    stats = scan(tmp_path)
+
+    paths = {f.path for f in stats.files}
+    assert not any("data/" in p for p in paths)
     assert "kept.py" in paths
 
 

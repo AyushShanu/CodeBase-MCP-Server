@@ -59,3 +59,9 @@ data/clones/
 *.index
 *.pkl
 *.pickle
+
+# --- Benchmark reports (regenerate via benchmarks/run_benchmark.py;
+#     a committed report risks going stale/misleading -- see DECISIONS.md
+#     D-025. The triage record lives in DECISIONS.md as prose instead.) ---
+benchmarks/results/*
+!benchmarks/results/.gitkeep
