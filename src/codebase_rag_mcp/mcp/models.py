@@ -81,4 +81,39 @@ class FileContextResult(BaseModel):
     content: str
 
 
-__all__ = ["FileContextResult", "FindSymbolResult", "SearchCodeResult", "SearchHit"]
+class RepositorySummaryResult(BaseModel):
+    """`repository_summary`'s response: deterministic repo-structure
+    evidence (always populated) plus an optional LLM narrative.
+
+    `distinct_symbol_count` counts DEFINITIONS, not chunks -- routed
+    through `impact.symbols.count_distinct_definitions` so an oversized
+    symbol split into `#part1`/`#part2` chunks is never double-counted
+    (see DECISIONS.md). `languages` mirrors `ingestion.models.RepoStats
+    .included_by_language`'s exact `dict[str, int]` shape. `top_level_modules`
+    is `PurePosixPath(chunk.file).parts[0]` for each distinct indexed file,
+    deduplicated and sorted -- a directory-structure heuristic, not real
+    package-boundary resolution (no `__init__.py`/`package.json` parsing);
+    an explicitly accepted V2 simplification, named here so this field's
+    output is never read as more precise than it is. `explanation` is
+    `None` when there are zero indexed chunks, or when every configured
+    LLM provider failed (the deterministic fields above are always
+    returned regardless)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    total_files: int
+    total_chunks: int
+    distinct_symbol_count: int
+    languages: dict[str, int]
+    top_level_modules: list[str]
+    top_level_module_count: int
+    explanation: str | None
+
+
+__all__ = [
+    "FileContextResult",
+    "FindSymbolResult",
+    "RepositorySummaryResult",
+    "SearchCodeResult",
+    "SearchHit",
+]

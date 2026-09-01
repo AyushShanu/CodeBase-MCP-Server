@@ -47,7 +47,9 @@ logger = logging.getLogger(__name__)
 MAX_IMPACT_REFERENCES_PER_KIND: Final[int] = 50
 
 _TEST_DIR_NAMES = frozenset({"test", "tests"})
-_TEST_FILENAME_RE = re.compile(r"^(test_.+\.py|.+_test\.py|.+\.test\.ts|.+\.spec\.ts)$", re.IGNORECASE)
+_TEST_FILENAME_RE = re.compile(
+    r"^(test_.+\.py|.+_test\.py|.+\.test\.ts|.+\.spec\.ts)$", re.IGNORECASE
+)
 
 
 def is_likely_test(file: str) -> bool:

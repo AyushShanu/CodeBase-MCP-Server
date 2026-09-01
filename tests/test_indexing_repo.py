@@ -216,6 +216,22 @@ def test_build_all_indexes_passes_the_same_chunk_list_to_both_builders(
     assert vector_ids  # non-empty -- both builders actually received chunks
 
 
+def test_build_all_indexes_never_indexes_a_secret_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(tmp_path / "a.py", _PY_SOURCE)
+    _write(tmp_path / ".env", b"SECRET_KEY=abc123\n")
+
+    monkeypatch.setattr(repo.vector, "build_index", _FakeStats.fake_vector_build_index)
+    monkeypatch.setattr(repo.bm25, "build_index", _FakeStats.fake_bm25_build_index)
+
+    build_all_indexes(tmp_path, index_dir=tmp_path / "idx")
+
+    assert len(_FakeStats.vector_calls) == 1
+    indexed_files = {c.file for c in _FakeStats.vector_calls[0]}
+    assert ".env" not in indexed_files
+
+
 def test_build_all_indexes_returns_vector_and_bm25_stats_tuple(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

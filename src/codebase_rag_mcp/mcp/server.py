@@ -74,6 +74,7 @@ from codebase_rag_mcp.generation.models import GeneratedAnswer  # noqa: E402
 from codebase_rag_mcp.generation.pipeline import generate_answer  # noqa: E402
 from codebase_rag_mcp.impact.analyzer import analyze_impact as compute_impact  # noqa: E402
 from codebase_rag_mcp.impact.models import ImpactResult  # noqa: E402
+from codebase_rag_mcp.impact.summary import build_repository_summary  # noqa: E402
 from codebase_rag_mcp.impact.symbols import match_symbol_chunks  # noqa: E402
 from codebase_rag_mcp.indexing import bm25, manifest, references, vector  # noqa: E402
 from codebase_rag_mcp.indexing.bm25 import Bm25Index  # noqa: E402
@@ -98,6 +99,7 @@ from codebase_rag_mcp.mcp.exceptions import (  # noqa: E402
 from codebase_rag_mcp.mcp.models import (  # noqa: E402
     FileContextResult,
     FindSymbolResult,
+    RepositorySummaryResult,
     SearchCodeResult,
     SearchHit,
 )
@@ -319,8 +321,8 @@ def _build_server(
     lifespan: Callable[[MCPServer[_ServerState]], AbstractAsyncContextManager[_ServerState]]
     | None = None,
 ) -> MCPServer[_ServerState]:
-    """Construct a fresh `MCPServer` with all five tools registered (V1's
-    four plus Day 10's `analyze_impact`).
+    """Construct a fresh `MCPServer` with all six tools registered (V1's
+    four, Day 10's `analyze_impact`, Day 11's `repository_summary`).
 
     `index_dir`/`lifespan` are test seams: real callers (`run()`) use the
     defaults; tests either point `index_dir` at a `tmp_path` index (real
@@ -397,6 +399,27 @@ def _build_server(
                 else state.bm25_index.chunks  # type: ignore[union-attr]
             )
         return compute_impact(symbol, chunks, state.reference_index)
+
+    @server.tool()
+    async def repository_summary(ctx: Context[_ServerState, Any]) -> RepositorySummaryResult:
+        """Deterministic repo-structure summary (language/file counts,
+        distinct symbol count, top-level modules) from already-indexed
+        chunk metadata, plus an optional LLM narrative. 'Top-level
+        modules' is a directory-structure heuristic (first path segment
+        of each indexed file), not real package-boundary resolution --
+        see the response model's own docstring. Degrades `explanation` to
+        None, never an error, when no LLM provider is configured or every
+        configured provider fails; a repository with zero indexed chunks
+        returns a zeroed result with `explanation=None` and no LLM call
+        at all."""
+        state: _ServerState = ctx.request_context.lifespan_context
+        async with state.lock:
+            chunks = (
+                state.vector_index.chunks
+                if state.vector_index is not None
+                else state.bm25_index.chunks  # type: ignore[union-attr]
+            )
+        return build_repository_summary(chunks)
 
     @server.tool()
     async def get_file_context(

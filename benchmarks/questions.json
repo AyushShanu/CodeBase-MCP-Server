@@ -110,5 +110,57 @@
     "expected_file": "source/queue.ts",
     "expected_symbol": null,
     "notes": "`RunFunction` and `Queue` types declared here; re-exported from source/index.ts."
+  },
+  {
+    "id": "q15",
+    "question": "What would break if PQueue.pause's behavior changed?",
+    "category": "impact",
+    "tool": "analyze_impact",
+    "expected_file": "source/index.ts",
+    "expected_symbol": "PQueue.pause",
+    "expected_min_evidence_count": 1,
+    "notes": "Exercises analyze_impact's definition assembly on a real, indexed method (Day 11)."
+  },
+  {
+    "id": "q16",
+    "question": "Where is lowerBound used?",
+    "category": "impact",
+    "tool": "analyze_impact",
+    "expected_file": "source/lower-bound.ts",
+    "expected_symbol": "lowerBound",
+    "expected_min_evidence_count": 1,
+    "notes": "lowerBound is called from PriorityQueue -- exercises cross-file caller resolution (Day 11)."
+  },
+  {
+    "id": "q17",
+    "question": "Where is the Queue interface used?",
+    "category": "impact",
+    "tool": "analyze_impact",
+    "expected_file": "source/queue.ts",
+    "expected_symbol": "Queue",
+    "expected_min_evidence_count": 1,
+    "notes": "Queue is implemented by PriorityQueue and re-exported from index.ts -- exercises importer resolution (Day 11)."
+  },
+  {
+    "id": "q18",
+    "question": "Summarize this repository's structure.",
+    "category": "impact",
+    "tool": "repository_summary",
+    "expected_file": null,
+    "expected_symbol": null,
+    "expected_language": "typescript",
+    "expected_min_top_level_modules": 2,
+    "notes": "Exercises repository_summary's deterministic aggregation over the real p-queue index (Day 11)."
+  },
+  {
+    "id": "q19",
+    "question": "What top-level modules does this repository have?",
+    "category": "impact",
+    "tool": "repository_summary",
+    "expected_file": null,
+    "expected_symbol": null,
+    "expected_language": "typescript",
+    "expected_min_top_level_modules": 2,
+    "notes": "p-queue has at least 'source' and 'test' top-level directories (Day 11)."
   }
 ]

@@ -15,11 +15,12 @@ flowchart LR
 
     subgraph Server[codebase-rag-mcp server]
         MCP[MCP stdio layer<br/>mcp/server.py]
-        TOOLS[Tool handlers<br/>search_code · find_symbol · get_file_context · ask · analyze_impact]
+        TOOLS[Tool handlers<br/>search_code · find_symbol · get_file_context · ask · analyze_impact · repository_summary]
         RETRIEVAL[Retrieval]
         RERANKER[Reranker]
         GEN[Generation]
         IMPACT[Impact analysis<br/>impact/analyzer.py]
+        SUMMARY[Repo summary<br/>impact/summary.py]
     end
 
     subgraph Indexes[Persisted indexes]
@@ -27,6 +28,7 @@ flowchart LR
         BM25[(BM25 sparse index)]
         META[(Chunk metadata store)]
         REFS[(Reference/import index)]
+        CACHE[(Chunk cache<br/>chunk_cache.json)]
     end
 
     subgraph Providers[LLM providers]
@@ -53,6 +55,9 @@ flowchart LR
     TOOLS --> IMPACT
     IMPACT --> REFS
     IMPACT --> GEN
+    TOOLS --> SUMMARY
+    SUMMARY --> META
+    SUMMARY --> GEN
 ```
 
 ---
@@ -179,15 +184,62 @@ once and builds `E` and `F` from the identical chunk list (D-020). `I`/`J`
 fresh `ReferenceIndex | None` load returns `None`, not an error; see
 D-024), unlike `E`/`G` and `F`/`H`'s strict "must be built first" contract.
 
+**Incremental indexing (`indexing.repo.build_all_indexes_incremental`,
+Day 11)** is the `codebase-rag index` CLI's only entry point as of this
+day (`build_all_indexes` above is unchanged and still exists, but is no
+longer called from the CLI — see DECISIONS.md D-025) — a cache-aware
+sibling with its own per-file hit/miss/deletion branching, feeding the
+exact same `E`/`F`/`I` build calls as the diagram above once the
+cached-plus-fresh chunk/embedding/reference set is assembled:
+
+```mermaid
+flowchart TD
+    A2[scan root] --> B9[ChunkCache.load index_dir<br/>never raises -- missing/corrupt = empty cache]
+    B9 --> C3{per included file}
+    C3 --> D4[hash_bytes file content]
+    D4 --> D5{cache.get file, hash}
+    D5 -->|hit| D6[reuse cached chunks + embeddings + references<br/>skip parse_file / chunk_file / embed_chunks entirely]
+    D5 -->|miss: unknown file or hash changed| D7[_parse_and_chunk_source<br/>same parse_file + chunk_file as D3 above]
+    D7 --> D8[accumulate this file's fresh chunks<br/>into ONE combined cross-file list]
+    D6 --> E2[after the loop: cache.retain_only included_paths<br/>drops entries for deleted/renamed/newly-filtered files]
+    D8 --> E1[exactly ONE vector.embed_chunks call<br/>over every cache-miss file's chunks combined -- D-017 batching preserved]
+    E1 --> E3[slice batched (chunks, vectors) back to per-file<br/>ChunkCacheEntry via chunk.id, cache.put each]
+    E3 --> E2
+    E2 --> F2[cache.write index_dir]
+    F2 --> G2[derive full_corpus_chunks + faiss_chunks/vectors<br/>from the cache itself, post-retain_only]
+    G2 --> E[[vector.build_index_from_embeddings<br/>same FAISS construction as E above]]
+    G2 --> F[[bm25.build_index -- ALWAYS full rebuild, never patched]]
+    G2 --> I[[references.build_index -- ALWAYS full rebuild, never patched]]
+    F2 -.-> K[("index_dir/<br/>chunk_cache.json")]
+```
+
+Two invariants worth stating explicitly (see DECISIONS.md D-025 for the
+full reasoning): BM25 and the reference index are **always** fully
+rebuilt from the complete current chunk/reference set every run,
+incremental or not — BM25's IDF weighting is a whole-corpus quantity a
+partial update would silently corrupt, so "incremental" only ever means
+skipping the expensive per-file parse/chunk/embed steps, never skipping
+index-structure construction itself. And `cache.retain_only` runs before
+every `cache.write()`, whether or not `--force` was used — a file that's
+disappeared, been renamed, or been newly excluded by a filter rule (e.g.
+this same day's secret-file/`data/`-directory exclusion additions) is
+dropped from the cache on the very next reindex, not left as a silent
+ghost entry. `cli/main.py`'s `--force` flag bypasses `ChunkCache` entirely
+(every file is a miss) without deleting `chunk_cache.json`, so a forced
+run also naturally repopulates the cache for the next incremental run.
+
 ---
 
 ## 3. Online query flow
 
-The MCP server (`mcp/server.py`, Day 08 + Day 10's `analyze_impact`) owns
-five tools. `search_code`, `find_symbol`, and `get_file_context` return
-raw evidence; `ask` calls `generate_answer`; `analyze_impact` calls
-`impact.analyzer.analyze_impact`, which itself may call `generate_answer`'s
-sibling `impact.explain.explain_impact`. All five read cached state
+The MCP server (`mcp/server.py`, Day 08 + Day 10's `analyze_impact` +
+Day 11's `repository_summary`) owns six tools. `search_code`,
+`find_symbol`, and `get_file_context` return raw evidence; `ask` calls
+`generate_answer`; `analyze_impact` calls `impact.analyzer.analyze_impact`,
+which itself may call `generate_answer`'s sibling
+`impact.explain.explain_impact`; `repository_summary` calls
+`impact.summary.build_repository_summary`, which may call that module's
+own `explain_repository_summary`. All six read cached state
 (`vector_index`, `bm25_index`, one `CrossEncoder`, one embedding-model
 instance, and — Day 10 — an optional `reference_index`) loaded/constructed
 exactly once at server startup via `lifespan` — see D-023/D-024 — never
@@ -384,6 +436,43 @@ node types the reference scanner relies on and the real false-positive
 bug (a `.js`-extensioned relative TS import) found and fixed during this
 day's own manual verification against the real `p-queue` demo repo.
 
+**`repository_summary` tool (Day 11, `tests/test_mcp_server.py`,
+`tests/test_repository_summary.py`):**
+
+```mermaid
+sequenceDiagram
+    participant U as User (via MCP client)
+    participant M as MCP server
+    participant Y as impact.summary
+    participant P as Provider chain
+
+    U->>M: tools/call { name: "repository_summary", arguments: {} }
+    M-->>M: read state.vector_index/bm25_index.chunks under state.lock
+    M->>Y: build_repository_summary(chunks)
+    alt chunks is empty
+        Y-->>M: RepositorySummaryResult(zeroed fields, explanation=None) -- no LLM call at all
+    else chunks non-empty
+        Y-->>Y: aggregate total_files/total_chunks/languages (dict[str,int])
+        Y-->>Y: distinct_symbol_count via impact.symbols.count_distinct_definitions -- never a raw per-chunk count (avoids #partN double-counting)
+        Y-->>Y: top_level_modules = PurePosixPath(file).parts[0] per distinct file, deduped + sorted -- directory heuristic, not real package resolution
+        Y->>P: explain_repository_summary(evidence) -- same NVIDIA -> Groq -> OpenRouter -> Gemini -> Local chain as ask/analyze_impact
+        P-->>Y: extract-JSON-then-validate loop (generation.pipeline's pattern, duplicated locally)
+        Y-->>Y: reject any referenced_modules entry absent from real top_level_modules -- retry, same as a JSON-validation failure
+        alt every provider fails or none configured
+            Y-->>M: explanation=None -- deterministic evidence still returned (mirrors analyze_impact's D-024 degradation)
+        else a provider succeeds
+            Y-->>M: verified narrative string
+        end
+    end
+    M-->>U: RepositorySummaryResult
+```
+
+Same lock discipline as `analyze_impact`: only the `.chunks` read happens
+under `state.lock`, released before deterministic aggregation and any LLM
+call. See DECISIONS.md D-025 for the full design rationale, including why
+`build_repository_summary` needed no `mcp/server.py` import alias (unlike
+`analyze_impact`'s `as compute_impact`).
+
 ---
 
 ## 4. Provider selection
@@ -458,6 +547,7 @@ configured provider.
 | Vector index  | `INDEX_DIR/vector.faiss` + `INDEX_DIR/vector_metadata.json` | `indexing/vector.py` |
 | BM25 index    | `INDEX_DIR/bm25.pkl` + `INDEX_DIR/bm25_metadata.json` | `indexing/bm25.py`   |
 | Reference index | `INDEX_DIR/references.json` (plain JSON, absence is lenient) | `indexing/references.py` |
+| Chunk cache   | `INDEX_DIR/chunk_cache.json` (plain JSON, keyed by file+content hash, absence is lenient -- Day 11) | `indexing/cache.py` |
 | Manifest      | `INDEX_DIR/manifest.json` (repo_root, source)          | `indexing/manifest.py` |
 | Logs          | stderr / `LOG_LEVEL`                   | `cli`, `mcp`     |
 | Caches        | `.cache/`, `.mypy_cache/`, `.ruff_cache/` (gitignored) | tooling  |

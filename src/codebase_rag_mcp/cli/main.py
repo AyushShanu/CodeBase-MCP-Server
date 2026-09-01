@@ -1,9 +1,9 @@
 """Command-line entrypoint for ``codebase-rag``.
 
-Subcommands are intentionally minimal. ``index`` is the bare enabler Day 08
-needs to make ``serve``'s tools runnable against a real repo end-to-end --
-it is not the CLI polish (flags, progress bars, incremental re-indexing)
-CLAUDE.md already scopes to Day 11.
+``index`` was the bare Day 08 enabler making ``serve``'s tools runnable
+against a real repo end-to-end; Day 11 adds the incremental-indexing
+``--force`` flag and its skip/reindex/delete count reporting -- the CLI
+polish CLAUDE.md scoped to this day.
 """
 
 from __future__ import annotations
@@ -41,33 +41,49 @@ def _build_parser() -> argparse.ArgumentParser:
         default=INDEX_DIR,
         help=f"Directory to write the index into (default: {INDEX_DIR}).",
     )
+    index_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass the incremental chunk cache; fully re-parse and re-embed every file.",
+    )
 
     sub.add_parser(
         "serve",
-        help="Run the MCP server (search_code, find_symbol, get_file_context, ask) over stdio.",
+        help=(
+            "Run the MCP server (search_code, find_symbol, get_file_context, ask, "
+            "analyze_impact, repository_summary) over stdio."
+        ),
     )
 
     return parser
 
 
-def _run_index(source: str, index_dir: str) -> int:
-    """Ingest `source` and build its vector + BM25 indexes under `index_dir`.
+def _run_index(source: str, index_dir: str, *, force: bool = False) -> int:
+    """Ingest `source` and incrementally build its vector + BM25 indexes
+    under `index_dir`, reusing cached parse/chunk/embed output for any
+    file whose content hasn't changed since the last run.
 
     Lazy-imports `ingestion`/`indexing` so `--version`/`--help` stay fast.
-    Prints basic stats and the manifest's `repo_root` on success.
+    Prints basic stats, the per-file cache accounting, and the manifest's
+    `repo_root` on success. `force=True` bypasses the cache entirely.
     """
-    from codebase_rag_mcp.indexing.repo import build_all_indexes
+    from codebase_rag_mcp.indexing.repo import build_all_indexes_incremental
     from codebase_rag_mcp.ingestion.loader import load_repo
 
     repo_source = load_repo(source)
-    vector_stats, bm25_stats = build_all_indexes(repo_source.root, index_dir=index_dir, repo=source)
+    stats = build_all_indexes_incremental(
+        repo_source.root, index_dir=index_dir, repo=source, force=force
+    )
     sys.stdout.write(
         f"Indexed {source!r} -> {index_dir}\n"
         f"  checkout root: {repo_source.root}\n"
-        f"  vector: {vector_stats.chunks_embedded} embedded, "
-        f"{vector_stats.chunks_skipped} skipped (dim={vector_stats.embedding_dimension})\n"
-        f"  bm25:   {bm25_stats.chunks_indexed} indexed, "
-        f"{bm25_stats.chunks_skipped} skipped (vocab={bm25_stats.vocabulary_size})\n"
+        f"  files: {stats.files_total} total, {stats.files_cache_hit} cached (skipped), "
+        f"{stats.files_cache_miss} reparsed/reembedded, {stats.files_deleted} removed"
+        f"{' (--force: cache bypassed)' if stats.force_used else ''}\n"
+        f"  vector: {stats.vector_stats.chunks_embedded} embedded, "
+        f"{stats.vector_stats.chunks_skipped} skipped (dim={stats.vector_stats.embedding_dimension})\n"
+        f"  bm25:   {stats.bm25_stats.chunks_indexed} indexed, "
+        f"{stats.bm25_stats.chunks_skipped} skipped (vocab={stats.bm25_stats.vocabulary_size})\n"
     )
     return 0
 
@@ -85,7 +101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "index":
-        return _run_index(args.source, args.index_dir)
+        return _run_index(args.source, args.index_dir, force=args.force)
 
     if args.command == "serve":
         # Lazy import keeps the CLI snappy when only --version is requested.

@@ -127,11 +127,35 @@ class Bm25QueryResult(BaseModel):
     score: float
 
 
+class IncrementalBuildStats(BaseModel):
+    """`indexing.repo.build_all_indexes_incremental`'s return value.
+
+    Wraps the same `VectorIndexStats`/`Bm25IndexStats` every full build
+    already returns, plus the per-file cache accounting the CLI reports
+    (`files_cache_hit`/`files_cache_miss`/`files_deleted`). A nested
+    model, not a wider tuple, so this function's return shape never
+    collides with `build_all_indexes`'s own existing
+    `tuple[VectorIndexStats, Bm25IndexStats]` contract -- that function
+    and its tests stay unchanged.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    vector_stats: VectorIndexStats
+    bm25_stats: Bm25IndexStats
+    files_total: int
+    files_cache_hit: int
+    files_cache_miss: int
+    files_deleted: int
+    force_used: bool
+
+
 __all__ = [
     "Bm25IndexStats",
     "Bm25QueryResult",
     "FileReadFailure",
     "FileReference",
+    "IncrementalBuildStats",
     "IndexedChunk",
     "RepoChunkCollection",
     "SkippedChunk",

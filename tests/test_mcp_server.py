@@ -195,7 +195,7 @@ def _map_embeddings_for_pause_query(query: str, chunks: list[Chunk]) -> None:
 # --- tool registration -------------------------------------------------------------- #
 
 
-def test_server_advertises_exactly_the_five_tools_no_ping(tmp_path: Path) -> None:
+def test_server_advertises_exactly_the_six_tools_no_ping(tmp_path: Path) -> None:
     index_dir = _build_real_index(tmp_path, _pqueue_chunks())
     server = _build_server(index_dir=index_dir)
 
@@ -207,6 +207,7 @@ def test_server_advertises_exactly_the_five_tools_no_ping(tmp_path: Path) -> Non
         "get_file_context",
         "ask",
         "analyze_impact",
+        "repository_summary",
     }
 
 
@@ -445,6 +446,40 @@ def test_analyze_impact_zero_definitions_returns_has_evidence_false_via_client_s
     assert content["explanation"] is None
 
 
+def test_repository_summary_tool_returns_real_data_via_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _delenv_all_providers(monkeypatch)
+    chunks = _pqueue_chunks()
+    index_dir = _build_real_index(tmp_path, chunks)
+    server = _build_server(index_dir=index_dir)
+
+    result = asyncio.run(_call(server, "repository_summary", {}))
+
+    assert not result.is_error
+    content = result.structured_content
+    assert content["total_files"] == 1
+    assert content["total_chunks"] == len(chunks)
+    assert content["distinct_symbol_count"] == 3
+    assert content["languages"] == {"python": 1}
+    assert content["top_level_modules"] == ["sample.py"]
+    assert content["top_level_module_count"] == 1
+    assert content["explanation"] is None
+
+
+def test_repository_summary_tool_degrades_explanation_to_none_without_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _delenv_all_providers(monkeypatch)
+    index_dir = _build_real_index(tmp_path, _pqueue_chunks())
+    server = _build_server(index_dir=index_dir)
+
+    result = asyncio.run(_call(server, "repository_summary", {}))
+
+    assert not result.is_error
+    assert result.structured_content["explanation"] is None
+
+
 def test_get_file_context_returns_exact_verbatim_lines_for_a_real_range(
     tmp_path: Path,
 ) -> None:
@@ -523,6 +558,27 @@ def test_get_file_context_rejects_symlink_escape_outside_repo_root(tmp_path: Pat
 
     result = asyncio.run(
         _call(server, "get_file_context", {"file": "escape.py", "start_line": 1, "end_line": 1})
+    )
+
+    assert result.is_error
+    assert "resolves outside repo_root" in str(result.content)
+
+
+def test_get_file_context_rejects_absolute_path_outside_repo_root(tmp_path: Path) -> None:
+    """Coverage-only addition (Day 11, Phase 3): `_resolve_and_check_containment`
+    already handles this correctly today -- `Path.__truediv__`'s "absolute
+    right operand discards the left" behavior is safe because the
+    containment check re-verifies the actual resolved path regardless of
+    how it was joined -- but no existing test exercised a plain absolute
+    path (as opposed to a `../` traversal or a symlink escape). See
+    DECISIONS.md: re-verified per CLAUDE.md/D-023, no code gap found."""
+    index_dir = _build_real_index(
+        tmp_path, _pqueue_chunks(), file_contents={"sample.py": _SAMPLE_PY_SOURCE}
+    )
+    server = _build_server(index_dir=index_dir)
+
+    result = asyncio.run(
+        _call(server, "get_file_context", {"file": "/etc/passwd", "start_line": 1, "end_line": 1})
     )
 
     assert result.is_error
