@@ -42,6 +42,15 @@ def _getenv_float(name: str, default: float) -> float:
         return default
 
 
+def _getenv_bool(name: str, default: bool) -> bool:
+    value = _getenv(name, str(default)).strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 # --- Provider keys --------------------------------------------------------- #
 
 NVIDIA_API_KEY: Final[str] = _getenv("NVIDIA_API_KEY")
@@ -110,6 +119,12 @@ DATA_DIR: Final[str] = _getenv("DATA_DIR", "./data")
 INDEX_DIR: Final[str] = _getenv("INDEX_DIR", "./data/index")
 
 
+# --- Auto-indexing settings (Day 12: zero-config `serve` startup) ---------- #
+
+REPO_SOURCE: Final[str] = _getenv("REPO_SOURCE")
+AUTO_INDEX: Final[bool] = _getenv_bool("AUTO_INDEX", True)
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderKeys:
     """Snapshot of cloud LLM provider keys loaded from the environment."""
@@ -130,6 +145,7 @@ def provider_keys() -> ProviderKeys:
 
 
 __all__ = [
+    "AUTO_INDEX",
     "DATA_DIR",
     "EMBEDDING_BATCH_SIZE",
     "EMBEDDING_MODEL_NAME",
@@ -151,6 +167,7 @@ __all__ = [
     "NVIDIA_MODEL_NAME",
     "OPENROUTER_API_KEY",
     "OPENROUTER_MODEL_NAME",
+    "REPO_SOURCE",
     "RERANKER_MAX_LENGTH",
     "RERANKER_MODEL_NAME",
     "RERANK_TOP_N",

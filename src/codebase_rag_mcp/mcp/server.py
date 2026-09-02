@@ -36,6 +36,22 @@ pipeline calls that actually touch it (`hybrid_search`/`rerank` inside
 never touches it, and `generate_answer` (a network call, not a local model)
 deliberately runs outside the lock so a slow LLM call never blocks
 `search_code`/`find_symbol`.
+
+**Day 12 -- zero-config auto-indexing on first connect:** when `lifespan`
+finds no usable index under `index_dir` (or an existing index's manifest
+covers a different repo than the one now being served), it no longer just
+raises `IndexNotAvailableError` -- if `auto_index` is enabled and an
+effective repo source can be resolved (`_resolve_effective_source`), it
+schedules the whole clone+build pipeline as one `asyncio.create_task`/
+`asyncio.to_thread` background task and `yield`s server state
+*immediately*, without ever awaiting that task. The MCP connection
+handshake therefore never blocks on an index build, regardless of repo
+size. Every tool call runs `_require_index_ready` as its first statement,
+raising `IndexBuildInProgressError`/`AutoIndexError` while the build is
+running/failed rather than touching still-`None` state or hanging. See
+DECISIONS.md for the full rationale (observed MCP client startup
+timeouts, the `.git`-presence gate on the zero-config default source, and
+why an already-valid index is never auto-refreshed on a plain restart).
 """
 
 from __future__ import annotations
@@ -48,7 +64,8 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, NamedTuple
+from urllib.parse import urlparse
 
 from codebase_rag_mcp import config
 
@@ -77,6 +94,7 @@ from codebase_rag_mcp.impact.models import ImpactResult  # noqa: E402
 from codebase_rag_mcp.impact.summary import build_repository_summary  # noqa: E402
 from codebase_rag_mcp.impact.symbols import match_symbol_chunks  # noqa: E402
 from codebase_rag_mcp.indexing import bm25, manifest, references, vector  # noqa: E402
+from codebase_rag_mcp.indexing import repo as indexing_repo  # noqa: E402
 from codebase_rag_mcp.indexing.bm25 import Bm25Index  # noqa: E402
 from codebase_rag_mcp.indexing.exceptions import (  # noqa: E402
     Bm25LoadError,
@@ -90,7 +108,10 @@ from codebase_rag_mcp.indexing.exceptions import (  # noqa: E402
 from codebase_rag_mcp.indexing.manifest import IndexManifest  # noqa: E402
 from codebase_rag_mcp.indexing.references import ReferenceIndex  # noqa: E402
 from codebase_rag_mcp.indexing.vector import VectorIndex  # noqa: E402
+from codebase_rag_mcp.ingestion import loader as repo_loader  # noqa: E402
 from codebase_rag_mcp.mcp.exceptions import (  # noqa: E402
+    AutoIndexError,
+    IndexBuildInProgressError,
     IndexNotAvailableError,
     InvalidLineRangeError,
     PathOutsideRepoRootError,
@@ -115,27 +136,67 @@ _BM25_UNAVAILABLE = (Bm25NotBuiltError, Bm25LoadError, EmptyBm25IndexError)
 _VECTOR_UNAVAILABLE = (IndexNotBuiltError, IndexLoadError, EmptyIndexError)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _ServerState:
-    """Cached, connection-lifetime state shared by every tool call.
+    """Cached, mostly-connection-lifetime state shared by every tool call.
 
-    `lock` guards the two calls that actually touch `vector_index`/
-    `bm25_index`/`cross_encoder`/`embeddings` (`hybrid_search`/`rerank`,
-    used by `search_code` and `ask`) -- `get_file_context` never acquires
-    it (it only reads the immutable `manifest` reference), and `ask`'s
-    `generate_answer` call runs outside it (a network call, not shared
-    local-model state).
+    Not `frozen` (Day 12) -- background auto-indexing needs to swap in a
+    freshly built `vector_index`/`bm25_index`/`cross_encoder`/`embeddings`/
+    `manifest`/`reference_index` once its build completes, and to flip
+    `indexing_status`/`indexing_error` as it progresses. Every mutation of
+    those seven fields, and every read that must observe a consistent
+    snapshot, MUST happen only while holding `lock` -- a convention this
+    codebase already relies on for `hybrid_search`/`rerank` (see D-023),
+    not something the type system enforces here either. `lock` itself is
+    fixed for the object's lifetime.
 
     `embeddings` is `None` when `vector_index` is `None` -- there is
     nothing to embed a query against, so no point constructing the model.
+    `cross_encoder` is `None` only while `indexing_status == "in_progress"`
+    (the slow path defers its ~9.7-9.9s construction, D-021, into the
+    background thread so it never blocks `lifespan`'s `yield`) -- every
+    tool guarded by `_require_index_ready` may assume it is non-`None`
+    once that guard passes.
 
     `reference_index` is loaded leniently (Day 10): its absence never
     blocks server startup, unlike `vector_index`+`bm25_index` both being
-    `None`, which does raise `IndexNotAvailableError` -- `analyze_impact`
+    `None`, which does raise `IndexNotAvailableError` (or, since Day 12,
+    triggers a background auto-index build instead) -- `analyze_impact`
     simply degrades to "definitions only, no callers/importers" when it
     is `None`, the same way every other tool works fine without a
     manifest.
+
+    `indexing_status`/`indexing_error` (Day 12) track a scheduled
+    background auto-index build: `"ready"` means every field above is
+    fully populated and safe to use; `"in_progress"` means a build is
+    running and every tool call must raise `IndexBuildInProgressError`
+    (via `_require_index_ready`) rather than touch the still-`None`
+    fields; `"failed"` means the build raised, `indexing_error` holds the
+    chained cause's message, and every tool call must raise
+    `AutoIndexError`. `indexing_task` holds a strong reference to the
+    `asyncio.Task` `lifespan` scheduled for that build -- `asyncio` only
+    keeps a *weak* reference to a scheduled task itself, so an
+    unreferenced one can be garbage-collected mid-flight; it is
+    write-once at construction and read-only afterward, so it needs no
+    lock protection of its own.
     """
+
+    vector_index: VectorIndex | None
+    bm25_index: Bm25Index | None
+    cross_encoder: CrossEncoder | None
+    embeddings: HuggingFaceEmbeddings | None
+    manifest: IndexManifest | None
+    reference_index: ReferenceIndex | None
+    lock: asyncio.Lock
+    indexing_status: Literal["ready", "in_progress", "failed"]
+    indexing_error: str | None
+    indexing_task: asyncio.Task[None] | None
+
+
+class _AutoIndexResult(NamedTuple):
+    """The six live-state fields rebuilt by a completed background
+    auto-index build (Day 12), returned by `_run_auto_index_build` and
+    swapped into `_ServerState` under `state.lock` by `_run_auto_index`."""
 
     vector_index: VectorIndex | None
     bm25_index: Bm25Index | None
@@ -143,57 +204,307 @@ class _ServerState:
     embeddings: HuggingFaceEmbeddings | None
     manifest: IndexManifest | None
     reference_index: ReferenceIndex | None
-    lock: asyncio.Lock
+
+
+def _load_ready_indexes(
+    index_dir: str | Path,
+) -> tuple[VectorIndex | None, Bm25Index | None, IndexManifest | None, ReferenceIndex | None]:
+    """Load whatever already exists under `index_dir`, tolerating absence
+    of any piece exactly as `_lifespan`'s original inline fast-path load
+    block always did.
+
+    Extracted (Day 12) so it can be reused both for the initial fast/slow
+    -path decision in `_lifespan` and, unchanged, inside a completed
+    background auto-index build's reload -- the ready state ends up
+    byte-identical whether the index already existed or was just built by
+    this same server process.
+    """
+    vector_index: VectorIndex | None = None
+    bm25_index: Bm25Index | None = None
+
+    try:
+        vector_index = vector.load_index(index_dir=index_dir)
+    except _VECTOR_UNAVAILABLE as exc:
+        logger.warning("vector index unavailable under %s: %s", index_dir, exc)
+
+    try:
+        bm25_index = bm25.load_index(index_dir=index_dir)
+    except _BM25_UNAVAILABLE as exc:
+        logger.warning("BM25 index unavailable under %s: %s", index_dir, exc)
+
+    loaded_manifest = manifest.load_manifest(index_dir)
+
+    loaded_reference_index: ReferenceIndex | None = None
+    try:
+        loaded_reference_index = references.load_index(index_dir=index_dir)
+    except ReferenceIndexLoadError as exc:
+        logger.warning("reference index unavailable/corrupt under %s: %s", index_dir, exc)
+
+    return vector_index, bm25_index, loaded_manifest, loaded_reference_index
+
+
+def _construct_embeddings(vector_index: VectorIndex | None) -> HuggingFaceEmbeddings | None:
+    """`None` when `vector_index` is `None` -- there is nothing to embed a
+    query against, so no point constructing the model. Extracted (Day 12)
+    so the fast path and a completed background build both go through
+    exactly one embeddings-construction call site."""
+    return (
+        HuggingFaceEmbeddings(
+            model_name=config.EMBEDDING_MODEL_NAME,
+            encode_kwargs={"normalize_embeddings": True, "batch_size": 1},
+        )
+        if vector_index is not None
+        else None
+    )
+
+
+def _resolve_effective_source(
+    *, repo_flag: str | None, repo_source_env: str, cwd: str | Path | None = None
+) -> str | None:
+    """Resolve the repo source zero-config auto-indexing should target, or
+    `None` if none can be safely inferred (Day 12).
+
+    Precedence: an explicit `--repo` flag, then a non-empty `REPO_SOURCE`
+    env var, then `cwd` itself -- but ONLY if `cwd` contains a `.git`
+    directory. The `.git` gate applies to this bare-`cwd` fallback tier
+    alone: an explicit `--repo`/`REPO_SOURCE` value (a local path or an
+    `https://` URL) is a deliberate user instruction and is honored as-is,
+    `.git` or not. Without the gate, launching `serve` from an arbitrary
+    directory (a home folder, a Downloads folder) with no explicit source
+    configured would silently scan and embed whatever happened to be
+    there.
+
+    `cwd` is a test seam -- production callers leave it `None`, resolving
+    the real `Path.cwd()`.
+    """
+    if repo_flag:
+        return repo_flag
+    if repo_source_env:
+        return repo_source_env
+    real_cwd = Path(cwd) if cwd is not None else Path.cwd()
+    if (real_cwd / ".git").exists():
+        return str(real_cwd)
+    return None
+
+
+def _manifest_matches_source(loaded_manifest: IndexManifest, effective_source: str) -> bool:
+    """Does `loaded_manifest` already cover `effective_source` (Day 12)?
+
+    `IndexManifest.repo_root` is always a local, resolved path -- even for
+    a URL source, since `write_manifest` is called with the *checkout*
+    root (a fresh temp clone dir under `DATA_DIR/clones/`), never the URL
+    itself. A URL source's `repo_root` therefore differs on every single
+    clone and can never identify it, so URL sources compare on
+    `manifest.source` instead (the raw original string passed to
+    `load_repo`, the one stable identity a URL has). Local sources compare
+    on the resolved `repo_root` instead of `.source` -- `.source` may be a
+    relative string while `effective_source` is already resolved (or vice
+    versa), so a raw string comparison there would be fragile; `repo_root`
+    is the one field `write_manifest` always normalizes to an absolute,
+    resolved path.
+    """
+    if urlparse(effective_source).scheme.lower() in repo_loader.ALLOWED_URL_SCHEMES:
+        return loaded_manifest.source == effective_source
+    return loaded_manifest.repo_root == str(Path(effective_source).resolve())
+
+
+def _run_auto_index_build(source: str, index_dir: str | Path) -> _AutoIndexResult:
+    """Synchronous body of a Day 12 background auto-index build -- runs
+    entirely inside one `asyncio.to_thread` call from `_run_auto_index`,
+    never on the event loop, so it can safely block for as long as a
+    clone plus a full parse/chunk/embed pass takes.
+
+    Mirrors `cli/main.py`'s `_run_index` exactly: `load_repo(source)` then
+    `build_all_indexes_incremental(repo_source.root, index_dir=index_dir,
+    repo=source)`, same argument names/order, no `force` (an auto-index
+    build always benefits from the incremental chunk cache the same way a
+    manual one does). `repo_source.cleanup()` runs whether the build
+    succeeds or fails -- a no-op for a local source, and removal of the
+    temp clone dir under `DATA_DIR/clones/` for a URL source, since the
+    checkout itself is never needed again once the index (or a definitive
+    failure) exists.
+    """
+    repo_source = repo_loader.load_repo(source)
+    try:
+        indexing_repo.build_all_indexes_incremental(
+            repo_source.root, index_dir=index_dir, repo=source
+        )
+    finally:
+        repo_source.cleanup()
+
+    vector_index, bm25_index, loaded_manifest, loaded_reference_index = _load_ready_indexes(
+        index_dir
+    )
+    cross_encoder = CrossEncoder(config.RERANKER_MODEL_NAME, max_length=config.RERANKER_MAX_LENGTH)
+    embeddings = _construct_embeddings(vector_index)
+    return _AutoIndexResult(
+        vector_index=vector_index,
+        bm25_index=bm25_index,
+        cross_encoder=cross_encoder,
+        embeddings=embeddings,
+        manifest=loaded_manifest,
+        reference_index=loaded_reference_index,
+    )
+
+
+async def _run_auto_index(state: _ServerState, *, source: str, index_dir: str | Path) -> None:
+    """Background task (Day 12) scheduled by `_lifespan`'s slow path.
+
+    Never awaited by `lifespan` itself -- `state.indexing_task` only holds
+    a reference so the task isn't garbage-collected mid-flight. On
+    success, swaps the six rebuilt live-state fields into `state` and sets
+    `indexing_status="ready"`, all under `state.lock`, mirroring exactly
+    what the fast path already does at startup -- no special-cased
+    in-memory handoff. On ANY exception, sets `indexing_status="failed"`
+    and `indexing_error` to the chained cause's message, also under
+    `state.lock`, and does NOT re-raise: an unhandled exception here would
+    otherwise be swallowed silently by `asyncio` (a task whose exception
+    is never retrieved just logs "Task exception was never retrieved" and
+    the server would look permanently stuck at `"in_progress"`), which is
+    exactly the silent-failure mode `AutoIndexError` exists to prevent.
+    """
+    try:
+        result = await asyncio.to_thread(_run_auto_index_build, source, index_dir)
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        async with state.lock:
+            state.indexing_status = "failed"
+            state.indexing_error = message
+        logger.error("auto-indexing %r under %s failed: %s", source, index_dir, message)
+        return
+
+    async with state.lock:
+        state.vector_index = result.vector_index
+        state.bm25_index = result.bm25_index
+        state.cross_encoder = result.cross_encoder
+        state.embeddings = result.embeddings
+        state.manifest = result.manifest
+        state.reference_index = result.reference_index
+        state.indexing_status = "ready"
+        state.indexing_error = None
+    logger.info(
+        "auto-indexing %r under %s complete: vector=%s bm25=%s manifest=%s references=%s",
+        source,
+        index_dir,
+        result.vector_index is not None,
+        result.bm25_index is not None,
+        result.manifest is not None,
+        result.reference_index is not None,
+    )
+
+
+async def _require_index_ready(state: _ServerState) -> None:
+    """Guard called as the first statement of every tool function (Day 12).
+
+    A short, self-contained `async with state.lock:` that reads and
+    releases immediately -- it must fully exit before a tool's own later
+    `async with state.lock:` block (e.g. inside `search_code`/`ask`)
+    begins, since `asyncio.Lock` is not reentrant and both run in the same
+    task/coroutine; nesting them would deadlock.
+    """
+    async with state.lock:
+        status = state.indexing_status
+        error = state.indexing_error
+    if status == "in_progress":
+        raise IndexBuildInProgressError(
+            "Auto-indexing is still building this repo's index; retry shortly."
+        )
+    if status == "failed":
+        raise AutoIndexError(error or "Auto-indexing failed for an unknown reason.")
 
 
 def _make_lifespan(
-    *, index_dir: str | Path = config.INDEX_DIR
+    *,
+    index_dir: str | Path = config.INDEX_DIR,
+    repo_source: str | None = None,
+    auto_index: bool = False,
+    cwd: str | Path | None = None,
 ) -> Callable[[MCPServer[_ServerState]], AbstractAsyncContextManager[_ServerState]]:
-    """Build a `lifespan` closure over `index_dir`.
+    """Build a `lifespan` closure over `index_dir` (and, since Day 12,
+    zero-config auto-indexing's `repo_source`/`auto_index`/`cwd`).
 
     A factory rather than a bare module-level function so tests can point
     it at a `tmp_path` index without touching `config.INDEX_DIR` globally.
+
+    `auto_index` defaults to `False` here (NOT `config.AUTO_INDEX`)
+    deliberately: this project's own checkout -- which every test in this
+    repo runs from -- has a `.git` directory, so if this default were
+    `True`, every pre-Day-12 test that calls `_make_lifespan(index_dir=
+    ...)`/`_build_server(index_dir=...)` without a `repo_source` would
+    resolve `effective_source` to the real project root via the
+    `.git`-at-cwd fallback and get misrouted into the new background-build
+    path the moment its own `tmp_path`-built manifest fails to match. Only
+    `run()`, the real CLI entrypoint, carries the actual
+    `config.AUTO_INDEX`-derived production default. `cwd` is a test seam,
+    threaded straight through to `_resolve_effective_source`.
     """
 
     @asynccontextmanager
     async def _lifespan(server: MCPServer[_ServerState]) -> AsyncIterator[_ServerState]:
-        vector_index: VectorIndex | None = None
-        bm25_index: Bm25Index | None = None
+        vector_index, bm25_index, loaded_manifest, loaded_reference_index = _load_ready_indexes(
+            index_dir
+        )
 
-        try:
-            vector_index = vector.load_index(index_dir=index_dir)
-        except _VECTOR_UNAVAILABLE as exc:
-            logger.warning("vector index unavailable under %s: %s", index_dir, exc)
-
-        try:
-            bm25_index = bm25.load_index(index_dir=index_dir)
-        except _BM25_UNAVAILABLE as exc:
-            logger.warning("BM25 index unavailable under %s: %s", index_dir, exc)
+        effective_source: str | None = None
+        needs_background_build = False
 
         if vector_index is None and bm25_index is None:
-            raise IndexNotAvailableError(
-                f"no index found under {index_dir!r} -- run 'codebase-rag index <repo>' first"
+            # No usable index at all: this is a cache-miss, auto-index's
+            # primary trigger. `auto_index=False` (or no resolvable
+            # source) preserves today's exact synchronous failure.
+            if auto_index:
+                effective_source = _resolve_effective_source(
+                    repo_flag=repo_source, repo_source_env=config.REPO_SOURCE, cwd=cwd
+                )
+            if effective_source is None:
+                raise IndexNotAvailableError(
+                    f"no index found under {index_dir!r} -- run 'codebase-rag index <repo>' first"
+                )
+            needs_background_build = True
+        elif auto_index and loaded_manifest is not None:
+            # An index exists: auto-index is a fallback, never a forced
+            # rebuild -- only trigger when the existing manifest is known
+            # to cover a DIFFERENT repo than the one now being served. No
+            # manifest at all (a legacy/pre-manifest index) is tolerated
+            # exactly as before Day 12, since there is nothing to compare.
+            effective_source = _resolve_effective_source(
+                repo_flag=repo_source, repo_source_env=config.REPO_SOURCE, cwd=cwd
             )
+            if effective_source is not None and not _manifest_matches_source(
+                loaded_manifest, effective_source
+            ):
+                needs_background_build = True
 
+        if needs_background_build:
+            assert effective_source is not None  # guaranteed by the branches above
+            state = _ServerState(
+                vector_index=None,
+                bm25_index=None,
+                cross_encoder=None,
+                embeddings=None,
+                manifest=None,
+                reference_index=None,
+                lock=asyncio.Lock(),
+                indexing_status="in_progress",
+                indexing_error=None,
+                indexing_task=None,
+            )
+            task = asyncio.create_task(
+                _run_auto_index(state, source=effective_source, index_dir=index_dir)
+            )
+            state.indexing_task = task
+            logger.info(
+                "codebase-rag-mcp starting: auto-indexing %r under %s in the background",
+                effective_source,
+                index_dir,
+            )
+            yield state
+            return
+
+        embeddings = _construct_embeddings(vector_index)
         cross_encoder = CrossEncoder(
             config.RERANKER_MODEL_NAME, max_length=config.RERANKER_MAX_LENGTH
         )
-        embeddings = (
-            HuggingFaceEmbeddings(
-                model_name=config.EMBEDDING_MODEL_NAME,
-                encode_kwargs={"normalize_embeddings": True, "batch_size": 1},
-            )
-            if vector_index is not None
-            else None
-        )
-        loaded_manifest = manifest.load_manifest(index_dir)
-
-        loaded_reference_index: ReferenceIndex | None = None
-        try:
-            loaded_reference_index = references.load_index(index_dir=index_dir)
-        except ReferenceIndexLoadError as exc:
-            logger.warning("reference index unavailable/corrupt under %s: %s", index_dir, exc)
-
         state = _ServerState(
             vector_index=vector_index,
             bm25_index=bm25_index,
@@ -202,6 +513,9 @@ def _make_lifespan(
             manifest=loaded_manifest,
             reference_index=loaded_reference_index,
             lock=asyncio.Lock(),
+            indexing_status="ready",
+            indexing_error=None,
+            indexing_task=None,
         )
         logger.info(
             "codebase-rag-mcp ready: vector=%s bm25=%s manifest=%s references=%s",
@@ -320,20 +634,30 @@ def _build_server(
     index_dir: str | Path = config.INDEX_DIR,
     lifespan: Callable[[MCPServer[_ServerState]], AbstractAsyncContextManager[_ServerState]]
     | None = None,
+    repo_source: str | None = None,
+    auto_index: bool = False,
 ) -> MCPServer[_ServerState]:
     """Construct a fresh `MCPServer` with all six tools registered (V1's
-    four, Day 10's `analyze_impact`, Day 11's `repository_summary`).
+    four, Day 10's `analyze_impact`, Day 11's `repository_summary`), each
+    guarded by `_require_index_ready` (Day 12) as its first statement.
 
     `index_dir`/`lifespan` are test seams: real callers (`run()`) use the
     defaults; tests either point `index_dir` at a `tmp_path` index (real
     lifespan, real tiny indexes, fake embeddings/`CrossEncoder`) or override
     `lifespan` entirely with a fake that yields a hand-built `_ServerState`
-    (no real model/index I/O at all).
+    (no real model/index I/O at all). `repo_source`/`auto_index` (Day 12)
+    are forwarded into `_make_lifespan` only when `lifespan` isn't
+    overridden -- like `index_dir`, they're ignored when a caller supplies
+    its own `lifespan`. `auto_index` defaults to `False` here, not
+    `config.AUTO_INDEX` -- see `_make_lifespan`'s own docstring for why;
+    `run()` alone carries the real production default.
     """
     server: MCPServer[_ServerState] = MCPServer(
         SERVER_NAME,
         version=_VERSION,
-        lifespan=lifespan if lifespan is not None else _make_lifespan(index_dir=index_dir),
+        lifespan=lifespan
+        if lifespan is not None
+        else _make_lifespan(index_dir=index_dir, repo_source=repo_source, auto_index=auto_index),
     )
 
     @server.tool()
@@ -344,7 +668,9 @@ def _build_server(
         ranked code evidence (file/symbol/line/content/score) -- not a
         generated answer; see the `ask` tool for that."""
         state: _ServerState = ctx.request_context.lifespan_context
+        await _require_index_ready(state)
         async with state.lock:
+            assert state.cross_encoder is not None  # guaranteed once the guard above passes
             candidates = hybrid_search(
                 query,
                 top_k=config.HYBRID_CANDIDATE_POOL_SIZE,
@@ -367,6 +693,7 @@ def _build_server(
         symbol with no matches returns an empty `matches` list, not an
         error."""
         state: _ServerState = ctx.request_context.lifespan_context
+        await _require_index_ready(state)
         async with state.lock:
             chunks = (
                 state.vector_index.chunks
@@ -392,6 +719,7 @@ def _build_server(
         definitions returns has_evidence=False and explanation=None,
         never an error."""
         state: _ServerState = ctx.request_context.lifespan_context
+        await _require_index_ready(state)
         async with state.lock:
             chunks = (
                 state.vector_index.chunks
@@ -413,6 +741,7 @@ def _build_server(
         returns a zeroed result with `explanation=None` and no LLM call
         at all."""
         state: _ServerState = ctx.request_context.lifespan_context
+        await _require_index_ready(state)
         async with state.lock:
             chunks = (
                 state.vector_index.chunks
@@ -432,6 +761,7 @@ def _build_server(
         `end_line` beyond the file's actual length is clamped to the last
         line rather than erroring."""
         state: _ServerState = ctx.request_context.lifespan_context
+        await _require_index_ready(state)
         current_manifest = state.manifest
         if current_manifest is None:
             raise RepoRootUnknownError(
@@ -451,7 +781,9 @@ def _build_server(
         Returns `has_sufficient_evidence=False` rather than a fabricated
         answer when the retrieved evidence doesn't support one."""
         state: _ServerState = ctx.request_context.lifespan_context
+        await _require_index_ready(state)
         async with state.lock:
+            assert state.cross_encoder is not None  # guaranteed once the guard above passes
             candidates = hybrid_search(
                 query,
                 top_k=config.HYBRID_CANDIDATE_POOL_SIZE,
@@ -465,10 +797,22 @@ def _build_server(
     return server
 
 
-def run() -> None:
-    """Synchronous entrypoint used by the CLI's `serve` subcommand."""
+def run(
+    *,
+    repo_source: str | None = None,
+    index_dir: str | Path = config.INDEX_DIR,
+    auto_index: bool = config.AUTO_INDEX,
+) -> None:
+    """Synchronous entrypoint used by the CLI's `serve` subcommand.
+
+    `auto_index` defaults to `config.AUTO_INDEX` -- this is the one call
+    site where the real, environment-driven zero-config auto-indexing
+    default (Day 12) actually takes effect; `_build_server`/`_make_lifespan`
+    themselves default `auto_index` to `False` for test isolation (see
+    their own docstrings).
+    """
     logger.info("Starting %s v%s", SERVER_NAME, _VERSION)
-    _build_server().run()
+    _build_server(index_dir=index_dir, repo_source=repo_source, auto_index=auto_index).run()
 
 
 __all__ = ["SERVER_NAME", "run"]

@@ -250,6 +250,75 @@ reconstructed per call, and never touched without holding
 its absence (or corruption, logged at startup) never blocks the server
 from starting, unlike `vector_index`+`bm25_index` both being absent.
 
+**`serve` startup (Day 12: zero-config auto-indexing):**
+
+```mermaid
+flowchart TD
+    Start[_lifespan starts] --> Load[_load_ready_indexes: try loading vector/bm25/manifest/references]
+    Load --> HasIndex{vector_index or bm25_index loaded?}
+    HasIndex -- no --> AutoOn1{auto_index enabled?}
+    AutoOn1 -- no --> Raise1[raise IndexNotAvailableError -- unchanged today's behavior]
+    AutoOn1 -- yes --> Resolve1[_resolve_effective_source: --repo flag -> REPO_SOURCE env -> cwd if cwd/.git exists]
+    Resolve1 --> Resolved1{source resolved?}
+    Resolved1 -- no --> Raise1
+    Resolved1 -- yes --> Slow[slow path]
+    HasIndex -- yes --> AutoOn2{auto_index enabled AND manifest loaded?}
+    AutoOn2 -- no --> Fast[fast path -- unchanged latency]
+    AutoOn2 -- yes --> Resolve2[_resolve_effective_source, same precedence]
+    Resolve2 --> Match{source resolved AND _manifest_matches_source is False?}
+    Match -- yes, mismatch --> Slow
+    Match -- no, matches or unresolved --> Fast
+
+    Slow --> Schedule[build _ServerState with indexing_status=in_progress, all live fields None; asyncio.create_task schedules _run_auto_index]
+    Schedule --> Yield1[yield state immediately -- lifespan never awaits the task]
+
+    Fast --> BuildCE[construct CrossEncoder + embeddings synchronously]
+    BuildCE --> Yield2[yield state with indexing_status=ready]
+```
+
+```mermaid
+sequenceDiagram
+    participant U as User (via MCP client)
+    participant M as MCP server (a tool call)
+    participant BG as _run_auto_index (background asyncio.Task)
+    participant TH as worker thread (asyncio.to_thread)
+
+    Note over BG,TH: scheduled by _lifespan's slow path, never awaited by lifespan itself
+    BG->>TH: _run_auto_index_build(source, index_dir)
+    TH-->>TH: repo_loader.load_repo(source) -- clones an https:// URL, or resolves a local path
+    TH-->>TH: indexing_repo.build_all_indexes_incremental(repo_source.root, index_dir=index_dir, repo=source)
+    TH-->>TH: repo_source.cleanup() in a finally -- removes the temp clone dir for a URL source, no-op for local, runs whether the build succeeded or failed
+    TH-->>TH: _load_ready_indexes(index_dir) -- same reload the fast path uses
+    TH-->>TH: construct CrossEncoder + embeddings (deferred here specifically so lifespan's yield was never blocked by their ~9.7-9.9s cost, D-021)
+    TH-->>BG: _AutoIndexResult
+
+    U->>M: tools/call (any of the six tools), concurrently, any time
+    M->>M: _require_index_ready(state) -- first statement, reads indexing_status/indexing_error under state.lock, releases immediately
+    alt indexing_status == "in_progress"
+        M-->>U: IndexBuildInProgressError ("retry shortly")
+    else indexing_status == "failed"
+        M-->>U: AutoIndexError(indexing_error) -- the chained real cause's message
+    else indexing_status == "ready"
+        M-->>M: proceed with the tool's own logic as normal
+        M-->>U: real result
+    end
+
+    alt background build succeeded
+        BG->>BG: async with state.lock: swap in vector_index/bm25_index/cross_encoder/embeddings/manifest/reference_index, indexing_status="ready"
+    else background build raised (any exception)
+        BG->>BG: async with state.lock: indexing_status="failed", indexing_error=str(exc) -- never re-raised, so the task never dies silently
+    end
+```
+
+An already-valid index for the same repo is never auto-refreshed just
+because the server restarted (the fast path above) — a deliberate,
+permanent limitation (see DECISIONS.md D-026), not solved by this
+feature. `_manifest_matches_source` compares differently for a URL vs. a
+local `effective_source`, since `IndexManifest.repo_root` is always a
+local, resolved path (the checkout root `write_manifest` was called
+with) — never the URL itself even for a URL source, whose `repo_root` is
+a fresh temp clone dir that differs on every clone.
+
 **`ask` tool:**
 
 ```mermaid

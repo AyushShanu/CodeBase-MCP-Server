@@ -47,11 +47,33 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Bypass the incremental chunk cache; fully re-parse and re-embed every file.",
     )
 
-    sub.add_parser(
+    serve_parser = sub.add_parser(
         "serve",
         help=(
             "Run the MCP server (search_code, find_symbol, get_file_context, ask, "
             "analyze_impact, repository_summary) over stdio."
+        ),
+    )
+    serve_parser.add_argument(
+        "--repo",
+        default=None,
+        help=(
+            "An https:// git URL or local path to zero-config auto-index if no usable "
+            "index exists yet under --index-dir (default: the REPO_SOURCE env var, or "
+            "the current directory if it contains a .git directory)."
+        ),
+    )
+    serve_parser.add_argument(
+        "--index-dir",
+        default=INDEX_DIR,
+        help=f"Directory to read/write the index from (default: {INDEX_DIR}).",
+    )
+    serve_parser.add_argument(
+        "--no-auto-index",
+        action="store_true",
+        help=(
+            "Disable zero-config auto-indexing; require an index already built by "
+            "'codebase-rag index' first."
         ),
     )
 
@@ -111,7 +133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # mcp.models cross-import would otherwise cycle through it).
         from codebase_rag_mcp.mcp.server import run
 
-        run()
+        run(repo_source=args.repo, index_dir=args.index_dir, auto_index=not args.no_auto_index)
         return 0
 
     # No subcommand and no --version: print help and exit non-zero.
