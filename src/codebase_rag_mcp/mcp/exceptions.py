@@ -22,7 +22,31 @@ class IndexNotAvailableError(MCPServerError):
     vector nor the BM25 index exists under `index_dir` -- there is nothing
     any tool could query. Surfaced at server startup, not per-call, so a
     misconfigured server fails immediately and visibly rather than
-    accepting connections and failing every tool call opaquely."""
+    accepting connections and failing every tool call opaquely. Since
+    Day 12's zero-config auto-indexing, this now fires only when
+    `auto_index=False` (an explicit opt-out) or when no effective repo
+    source can be resolved (no `--repo`/`REPO_SOURCE`, and no `.git`
+    directory at `cwd`) -- every other missing-index case is instead
+    handled by scheduling a background build; see `AutoIndexError` and
+    `IndexBuildInProgressError`."""
+
+
+class AutoIndexError(MCPServerError):
+    """Raised by `_require_index_ready` when a background auto-index build
+    scheduled by `lifespan` (Day 12's zero-config auto-indexing) failed --
+    a bad source, a clone failure, zero files parsed, etc. Surfaced at the
+    *next* tool call after the background task recorded the failure under
+    `state.lock`, never as an unhandled crash of the server process itself.
+    The message is the chained underlying `ingestion`/`indexing`
+    exception's own message, so the client sees the real cause."""
+
+
+class IndexBuildInProgressError(MCPServerError):
+    """Raised by `_require_index_ready` when a background auto-index build
+    scheduled by `lifespan` (Day 12's zero-config auto-indexing) is still
+    running -- an ordinary, expected transient state right after a
+    zero-config `serve` startup against a repo with no existing index, not
+    a failure. Callers should retry shortly."""
 
 
 class RepoRootUnknownError(MCPServerError):
@@ -52,6 +76,8 @@ class InvalidLineRangeError(MCPServerError):
 
 
 __all__ = [
+    "AutoIndexError",
+    "IndexBuildInProgressError",
     "IndexNotAvailableError",
     "InvalidLineRangeError",
     "MCPServerError",

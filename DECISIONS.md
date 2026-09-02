@@ -1585,3 +1585,138 @@
   gap and the retrieval-ranking-quality gaps surfaced by the real
   benchmark run remain open, named V2 items for a future day, not
   reopened here.
+
+---
+
+## D-026 · Zero-config auto-indexing on first connect: non-blocking background build, `.git`-gated default source, URL-vs-local manifest matching, unfrozen `_ServerState` (day-12-zero-config-auto-indexing)
+
+- **Date:** 2026-09-02
+- **Status:** Accepted
+- **Context:** `codebase-rag serve` required a prior manual
+  `codebase-rag index <repo>` run or it refused to start
+  (`IndexNotAvailableError`) — the last piece of "clone and run" friction
+  before a new user could just add this server to Claude Code/Desktop and
+  connect. CLAUDE.md's own Day 12 slot is titled "Final QA & Open-Source
+  Packaging," not this feature; it was filed at `day_number=12` per an
+  explicit user request on top of an already-further-along actual repo
+  state (Days 02–11 were already merged despite CLAUDE.md's roadmap
+  checkboxes still showing most as unchecked) — flagged, not silently
+  resolved, in the spec itself.
+
+- **Decision — the whole clone+build pipeline runs as one background
+  task, never blocking `lifespan`'s `yield`:** the first spec draft for
+  this day had auto-indexing run synchronously inside `lifespan` before
+  `yield`ing state, accepting the resulting startup delay as a tradeoff.
+  That was revised before implementation: MCP clients enforce startup
+  timeouts, so a synchronous full index build (which can take minutes for
+  a real repo, or ~10s just for `CrossEncoder` construction alone per
+  D-021) at connect time is not an acceptable tradeoff. `_lifespan` now
+  schedules `_run_auto_index` via `asyncio.create_task(...)`, which itself
+  runs `load_repo` + `build_all_indexes_incremental` + the post-build
+  reload + `CrossEncoder`/`HuggingFaceEmbeddings` reconstruction inside a
+  single `asyncio.to_thread(...)` call, and `yield`s immediately without
+  ever awaiting that task. `_ServerState.indexing_task` holds a strong
+  reference to the scheduled task purely because `asyncio` itself only
+  keeps a *weak* reference to one — an unreferenced task can otherwise be
+  garbage-collected mid-flight.
+
+- **Decision — every tool call guards on `indexing_status` instead of the
+  MCP tool contract gaining a status field:** all six tools call
+  `_require_index_ready(state)` as their first statement, raising
+  `IndexBuildInProgressError` (build running) or `AutoIndexError` (build
+  failed, message = the chained cause) — ordinary MCP tool-call errors,
+  the same mechanism `IndexNotAvailableError`/`PathOutsideRepoRootError`
+  already use, rather than threading a new "status" field through six
+  different Pydantic response models. Smaller diff, same guarantee (no
+  crash-without-explanation, no silent empty result indistinguishable
+  from a genuine zero-evidence answer).
+
+- **Decision — `_ServerState` unfrozen (`frozen=True` dropped, `slots=True`
+  kept), not boxed:** the background task needs to swap in a freshly
+  built `vector_index`/`bm25_index`/`cross_encoder`/`embeddings`/
+  `manifest`/`reference_index` once its build completes, and flip
+  `indexing_status`/`indexing_error` as it progresses. A nested mutable
+  container (`state.live.vector_index`) would be more strictly correct
+  but would force edits across every tool body and every existing
+  `test_mcp_server.py` assertion for no behavioral benefit — this
+  codebase already relies on `state.lock` as a *convention-enforced*, not
+  type-enforced, synchronization boundary for exactly these fields (see
+  D-023), so unfreezing is the lower-diff choice consistent with that
+  existing pattern. Every mutation/consistent-snapshot-read of the seven
+  live-state fields must still happen only under `state.lock`.
+
+- **Decision — `CrossEncoder` construction deferred into the background
+  thread on the slow path, making `_ServerState.cross_encoder` `Optional`:**
+  D-021 measured its construction at ~9.7–9.9s; building it synchronously
+  before `yield` on the slow path (matching the fast path's existing
+  order) would silently reintroduce that blocking delay on exactly the
+  path this feature exists to remove. `search_code`/`ask` each get an
+  explicit `assert state.cross_encoder is not None` immediately after
+  `_require_index_ready` passes — `indexing_status == "ready"` guarantees
+  it is populated, so this is both a real invariant check and what
+  satisfies mypy for the now-`Optional` field.
+
+- **Decision — auto-index is a fallback, never a forced rebuild, and is
+  gated by comparing the existing manifest against a resolved "effective
+  source":** `_resolve_effective_source` resolves with precedence
+  `--repo` CLI flag → `REPO_SOURCE` env var → `cwd`, but the bare-`cwd`
+  fallback tier alone is gated on a `.git` directory actually being
+  present there — an explicit `--repo`/`REPO_SOURCE` (local path or
+  `https://` URL) is a deliberate user instruction and is honored as-is,
+  `.git` or not. Without this gate, launching `serve` from an arbitrary
+  directory (a home folder, a Downloads folder) with no explicit source
+  configured would silently scan and embed whatever happened to be there.
+  `_manifest_matches_source` then decides whether a background build is
+  even needed: `IndexManifest.repo_root` is always a local, resolved
+  path — even for a URL source, since `write_manifest` is called with the
+  *checkout* root (a fresh temp clone dir under `DATA_DIR/clones/`), never
+  the URL itself — so a URL source's `repo_root` differs on every single
+  clone and can never identify it; URL sources therefore compare on
+  `manifest.source` (the raw original string) instead, while local
+  sources compare on the resolved `repo_root` instead of `.source`
+  (`.source` may be relative while the effective source is already
+  resolved, or vice versa, making a raw string comparison fragile there).
+  An already-valid index for the same repo is **never** auto-refreshed
+  just because the server restarted — this is a deliberate, permanent
+  limitation, not an oversight: a file edited outside any MCP session is
+  not picked up until the next explicit `codebase-rag index` run or a
+  repo-root change forces a rebuild.
+
+- **Decision — `RepoSource.cleanup()` called unconditionally after the
+  build, success or failure:** a URL source's temp clone dir under
+  `DATA_DIR/clones/` is removed either way, since the index (or a
+  definitive failure) is self-contained afterward and the checkout itself
+  is never needed again; a no-op for local sources.
+
+- **Decision — `auto_index` defaults to `False` in `_build_server`/
+  `_make_lifespan`, and only `run()` (the real CLI entrypoint) carries the
+  actual `config.AUTO_INDEX`-derived production default:** this project's
+  own checkout — which every test in this repo runs from — has a `.git`
+  directory. Confirmed by direct inspection of `tests/test_mcp_server.py`
+  (its ~25 existing `_make_lifespan(index_dir=...)`/`_build_server(
+  index_dir=...)` call sites never pass a `repo_source`) that defaulting
+  `auto_index` to `config.AUTO_INDEX` (`True`) would have resolved
+  `effective_source` to the real project root via the `.git`-at-`cwd`
+  fallback in every one of those tests, failed to match each test's own
+  `tmp_path`-built manifest, and misrouted the bulk of the existing fast-
+  path suite into the new background-build path. Defaulting to `False`
+  keeps every pre-Day-12 test call site cwd-independent by construction;
+  confirmed by re-running the full unmodified `tests/test_mcp_server.py`
+  suite as a checkpoint both before and after this day's change (one
+  pre-existing, unrelated failure both times — `test_ask_raises_clear_
+  error_when_no_provider_configured`, a real-but-404ing `GROQ_API_KEY` in
+  this machine's local `.env`, already documented in D-025).
+
+- **Consequences:** `mcp/exceptions.py` gains `AutoIndexError`/
+  `IndexBuildInProgressError`; `IndexNotAvailableError`'s docstring notes
+  it now fires only for `auto_index=False` or an unresolvable effective
+  source. `config.py` gains `REPO_SOURCE`/`AUTO_INDEX` (plus a
+  `_getenv_bool` helper) and `.env.example` documents both. `cli/main.py`'s
+  `serve` subcommand gains `--repo`/`--index-dir`/`--no-auto-index` flags.
+  New `tests/test_mcp_auto_index.py` covers the state machine, the pure
+  `_resolve_effective_source`/`_manifest_matches_source` helpers, the
+  non-blocking slow path (an artificially-gated real build, asserting
+  `lifespan` yields well before the gate is released), fast-path skip,
+  cross-repo reindex, both `.git`-gate branches, `--no-auto-index`,
+  in-progress/failed tool-call errors (both hand-built and via a real
+  gated build), and temp-clone cleanup on success and failure.
