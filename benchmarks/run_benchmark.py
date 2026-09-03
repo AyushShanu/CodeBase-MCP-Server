@@ -144,6 +144,7 @@ def _load_context(index_dir: str | Path) -> BenchmarkContext:
         chunks=chunks,
     )
 
+
 # search function that mirrors the MCP server's `search_code` tool path, but
 # without the MCP protocol -- returns a list of `SearchHit` dataclasses
 def _search_hits(ctx: BenchmarkContext, query: str, *, top_k: int = 10) -> list[SearchHit]:
