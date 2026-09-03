@@ -3,17 +3,24 @@
 ``index`` was the bare Day 08 enabler making ``serve``'s tools runnable
 against a real repo end-to-end; Day 11 adds the incremental-indexing
 ``--force`` flag and its skip/reindex/delete count reporting -- the CLI
-polish CLAUDE.md scoped to this day.
+polish CLAUDE.md scoped to this day. Day 13
+(13-cross-agent-mcp-packaging-portability) adds ``--env-file`` and the
+explicit ``config._resolve_index_dir``/``_resolve_env_path`` resolution
+calls in ``main()`` -- see DECISIONS.md D-027.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
-from codebase_rag_mcp import __version__
-from codebase_rag_mcp.config import INDEX_DIR
+from dotenv import load_dotenv
+
+from codebase_rag_mcp import __version__, config
+from codebase_rag_mcp.mcp.exceptions import InvalidIndexDirError
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -38,8 +45,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     index_parser.add_argument(
         "--index-dir",
-        default=INDEX_DIR,
-        help=f"Directory to write the index into (default: {INDEX_DIR}).",
+        default=None,
+        help=(
+            "Directory to write the index into (default: an OS-appropriate per-repo "
+            "directory under the platformdirs user-data path, keyed by a hash of the "
+            "resolved repo source -- the same repo always resolves to the same directory "
+            "regardless of the current directory. An explicit value here must be "
+            "absolute; a relative path is rejected outright, never silently resolved "
+            "against the current directory)."
+        ),
     )
     index_parser.add_argument(
         "--force",
@@ -65,8 +79,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     serve_parser.add_argument(
         "--index-dir",
-        default=INDEX_DIR,
-        help=f"Directory to read/write the index from (default: {INDEX_DIR}).",
+        default=None,
+        help=(
+            "Directory to read/write the index from (default: an OS-appropriate per-repo "
+            "directory under the platformdirs user-data path, keyed by a hash of the "
+            "resolved repo source -- the same repo always resolves to the same directory "
+            "regardless of the current directory or which MCP client launched this "
+            "process. An explicit value here must be absolute; a relative path is "
+            "rejected outright, never silently resolved against the current directory)."
+        ),
     )
     serve_parser.add_argument(
         "--no-auto-index",
@@ -76,11 +97,21 @@ def _build_parser() -> argparse.ArgumentParser:
             "'codebase-rag index' first."
         ),
     )
+    serve_parser.add_argument(
+        "--env-file",
+        default=None,
+        help=(
+            "Explicit path to a .env file to load -- highest precedence, overriding the "
+            "resolved repo-root .env and the current-directory .env fallback. A variable "
+            "already set in the process environment -- e.g. by an MCP client's own "
+            '"env" config block -- is never overridden by any .env file.'
+        ),
+    )
 
     return parser
 
 
-def _run_index(source: str, index_dir: str, *, force: bool = False) -> int:
+def _run_index(source: str, index_dir: str | Path, *, force: bool = False) -> int:
     """Ingest `source` and incrementally build its vector + BM25 indexes
     under `index_dir`, reusing cached parse/chunk/embed output for any
     file whose content hasn't changed since the last run.
@@ -123,17 +154,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "index":
-        return _run_index(args.source, args.index_dir, force=args.force)
+        try:
+            resolved_index_dir = config._resolve_index_dir(args.source, explicit=args.index_dir)
+        except InvalidIndexDirError as exc:
+            sys.stderr.write(f"error: {exc}\n")
+            return 2
+        return _run_index(args.source, resolved_index_dir, force=args.force)
 
     if args.command == "serve":
-        # Lazy import keeps the CLI snappy when only --version is requested.
-        # Imports mcp.server directly (not the codebase_rag_mcp.mcp package)
-        # to avoid the package __init__ eagerly loading mcp.server -- see
+        # Day 13: resolve the effective repo source, the index directory,
+        # and which single .env file (if any) to load -- and reload
+        # `config` -- BEFORE importing mcp.server below. Config's
+        # provider-key/INDEX_DIR-style constants are `Final`, captured once
+        # at each module's own import time; every indexing/generation
+        # submodule captures its own such defaults the instant mcp.server
+        # is first imported. Doing this resolution after that import would
+        # be too late for any of it to take effect. See DECISIONS.md D-027.
+        effective_source = config._resolve_effective_source(
+            repo_flag=args.repo, repo_source_env=config.REPO_SOURCE, cwd=None
+        )
+        try:
+            resolved_index_dir = config._resolve_index_dir(
+                effective_source, explicit=args.index_dir
+            )
+        except InvalidIndexDirError as exc:
+            sys.stderr.write(f"error: {exc}\n")
+            return 2
+
+        env_path = config._resolve_env_path(effective_source or "", explicit=args.env_file)
+        if env_path is not None and env_path != config._DOTENV_PATH:
+            load_dotenv(env_path, override=False)
+        importlib.reload(config)
+
+        # Lazy import keeps the CLI snappy when only --version is requested,
+        # and -- as of Day 13 -- ensures every transitively-imported
+        # indexing/generation submodule's own def-time config defaults see
+        # the fully-resolved environment from above. Imports mcp.server
+        # directly (not the codebase_rag_mcp.mcp package) to avoid the
+        # package __init__ eagerly loading mcp.server -- see
         # mcp/__init__.py's own docstring for why (Day 10 impact.models ->
         # mcp.models cross-import would otherwise cycle through it).
         from codebase_rag_mcp.mcp.server import run
 
-        run(repo_source=args.repo, index_dir=args.index_dir, auto_index=not args.no_auto_index)
+        run(
+            repo_source=effective_source,
+            index_dir=resolved_index_dir,
+            auto_index=not args.no_auto_index,
+            env_path=env_path,
+        )
         return 0
 
     # No subcommand and no --version: print help and exit non-zero.

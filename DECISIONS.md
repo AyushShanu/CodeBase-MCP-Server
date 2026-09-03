@@ -7,6 +7,213 @@
 
 ---
 
+## D-027 · Cross-agent MCP packaging & portability: per-repo-hash-keyed `INDEX_DIR` under `platformdirs`, single-winning-file `.env` precedence, relative `--index-dir` rejected outright, `_resolve_effective_source` relocated to `config.py` (13-cross-agent-mcp-packaging-portability)
+
+- **Date:** 2026-09-02
+- **Status:** Accepted
+- **Context:** every prior MCP day (08, 11, 12) was built and tested from
+  this repo's own dev shell, where `cwd` is always the project root and
+  `.env` sits right next to it. Real MCP clients (Claude Desktop, Cursor,
+  Claude Code, etc.) launch `codebase-rag serve` as a subprocess with
+  their *own* working directory -- not the user's project. `config.py`
+  defined `DATA_DIR`/`INDEX_DIR` as the relative strings `"./data"`/
+  `"./data/index"`, and `.env` loaded via a bare `load_dotenv(override=
+  False)` at `config.py`'s import time -- both effectively cwd-dependent.
+  The same `codebase-rag serve` command added to two different clients'
+  configs could resolve `INDEX_DIR` to two different places, silently
+  rebuild an index that already exists elsewhere, or fail to pick up
+  provider keys at all. This day was added post-plan-window (CLAUDE.md's
+  original 20-31 Aug 2026 window ended before this work started) per an
+  explicit user request -- flagged, not silently folded into an existing
+  day, when the spec was created (`.claude/specs/
+  13-cross-agent-mcp-packaging-portability.md`).
+
+- **Decision -- `INDEX_DIR` becomes a path keyed by a hash of the
+  *resolved repo source*, never `cwd`, via a new `config._resolve_index_dir
+  (repo_source, explicit)`:** with no explicit override, the index
+  directory is `platformdirs.user_data_dir("codebase-rag")/index/<16-hex
+  sha256 of the canonicalized repo source>/` -- the same repo always
+  resolves to the same directory regardless of which directory or MCP
+  client launched the server, and two different repos can never collide
+  on one shared default. A local source is canonicalized via
+  `Path(...).resolve()` (non-strict -- a URL source that hasn't been
+  cloned yet may not exist on disk); a remote `https://` URL is
+  normalized by lowercasing scheme+host and stripping a trailing `.git`/
+  `/`, so trivially different spellings of the same remote hash
+  identically. The naive alternative -- one fixed, shared `INDEX_DIR` for
+  every repo -- was rejected outright: it is exactly the collision class
+  this project has already hit before under manual configuration. With no
+  explicit override and no resolvable repo source at all (no `--repo`,
+  no `REPO_SOURCE`, no `.git` at `cwd`), this degrades to the pre-Day-13
+  static `INDEX_DIR` default -- not a new collision risk, since without a
+  resolved source no index build could ever have started anyway (see
+  `IndexNotAvailableError`).
+
+- **Decision -- `config.INDEX_DIR` itself is left untouched; the fix
+  lives entirely in `cli/main.py`'s dispatch:** `config.INDEX_DIR`
+  (`_getenv("INDEX_DIR", "./data/index")`) is captured as a def-time
+  default-parameter value in roughly fifteen places across
+  `mcp/server.py`, `cli/main.py`, and every `indexing/*.py` module.
+  Changing its *value* alone would do nothing for any already-imported
+  module, and redefining it to something that itself depends on a
+  not-yet-known repo source is incoherent at module-import time. Instead,
+  `indexing/*` keeps its existing static default for direct/library/test
+  callers (backward compatible, zero changes needed there), and both the
+  `index` and `serve` CLI subcommands switch their `--index-dir` argparse
+  default from `INDEX_DIR` to `None`, calling `config._resolve_index_dir`
+  explicitly in `main()`'s dispatch before invoking `_run_index`/`run`.
+  **Both subcommands resolve to the identical `INDEX_DIR` for the same
+  repo** -- `index`'s repo source is its `source` positional argument
+  directly; `serve`'s is the already-resolved effective source (see
+  below) -- otherwise a later `codebase-rag serve --repo <repo>` from a
+  different client/cwd would silently miss what `codebase-rag index
+  <repo>` already built.
+
+- **Decision -- relative `--index-dir`/`INDEX_DIR` is rejected outright
+  (`InvalidIndexDirError`), never silently absolutized:** the spec this
+  day was built from (`.claude/specs/
+  13-cross-agent-mcp-packaging-portability.md`) contradicted itself here
+  -- one line said an explicit relative value should be resolved to
+  absolute; two other places (its own DoD test list and the `cli/main.py`
+  bullet) said it should be rejected outright. **Per explicit user
+  instruction, resolving that contradiction: rejection wins.** Silently
+  reinterpreting a relative `--index-dir` against `cwd` would reintroduce
+  exactly the launch-directory-dependent bug class this day exists to
+  close, so failing loudly with a clear, catchable exception
+  (`mcp/exceptions.py`, single-string-message style matching every other
+  exception in that file) was chosen over silent convenience.
+
+- **Decision -- `.env` discovery precedence picks exactly one winning
+  file, never a layered merge:** `config._resolve_env_path(repo_source,
+  explicit)` precedence is: an explicit `--env-file` (returned even if
+  missing, so a typo is debuggable via the startup log rather than
+  silently swapped for a different file) -> `<repo_source>/.env` if the
+  source is local -> `<os.getcwd()>/.env` (today's original behavior,
+  kept as the final fallback so a developer running from inside their own
+  checkout is unaffected) -> `None`. Selecting and loading exactly one
+  file, rather than layering several, was chosen because
+  `load_dotenv(..., override=False)` cannot distinguish "already set by a
+  real process env var" from "already set by an earlier, lower-precedence
+  `.env` load" once both values are sitting in `os.environ` -- layering
+  would be unable to correctly let a higher-precedence file override a
+  lower-precedence one for the same variable. **The most important
+  invariant is unconditionally correct regardless of this: a variable
+  already present in the real process environment -- an MCP client's own
+  `"env"` config block, a shell export -- is never overridden by any
+  `.env` file, in any order**, since that guarantee depends only on
+  `override=False` plus the real env var being set before any
+  `load_dotenv` call, which always holds. **Accepted, narrow limitation:**
+  if a user has both a `cwd/.env` (loaded eagerly at `config.py` import
+  time) and a different, conflicting repo-root `.env`/`--env-file`
+  setting the *same* variable to a *different* value, and that variable
+  is not also a real process env var, the earlier-loaded `cwd` value may
+  win even though precedence says the higher-precedence file should --
+  a low-stakes edge case, documented here rather than solved, since the
+  documented, recommended production path for provider keys is the MCP
+  client's own `"env"` block, not `.env` discovery at all.
+
+- **Decision -- `_resolve_effective_source` (Day 12's function)
+  relocated from `mcp/server.py` into `config.py`, re-exported unchanged
+  from `mcp.server` for backward compatibility:** picking the right
+  `.env` file requires the *resolved* effective repo source, but
+  resolving it lived in `mcp/server.py`, which is deliberately lazily
+  imported only inside `cli/main.py`'s `serve` branch (to keep
+  `--version` fast, and to avoid the `impact.models`<->`mcp.models`
+  import cycle `mcp/__init__.py`'s own docstring warns about). Importing
+  `mcp.server` at all triggers every `indexing/*`/`generation/*`
+  submodule's own def-time config capture -- too late to matter by then.
+  `_resolve_effective_source` has no heavy dependencies of its own (just
+  `Path`/`.git`-existence checks), so `config.py` -- already imported
+  early and cheaply everywhere -- is its natural home. Verified by direct
+  read that none of `codebase_rag_mcp/__init__.py`, `cli/__init__.py`, or
+  `mcp/__init__.py` eagerly import anything heavy, so this relocation
+  needed no changes to any of the three.
+
+- **Decision -- `cli/main.py`'s `serve` dispatch resolves source, index
+  dir, and `.env`, then calls `importlib.reload(config)`, all *before*
+  importing `mcp.server` for the first time:** this is what makes every
+  transitively-imported `indexing/*`/`generation/*` submodule's own
+  def-time config capture see the fully-resolved environment, since
+  `config.py`'s provider-key/other `Final` constants were already frozen
+  at `cli/main.py`'s own top-level `from codebase_rag_mcp import config`
+  import (before argparse even parses `--repo`/`--env-file`). This is a
+  new pattern for production code -- previously `importlib.reload(config)`
+  was only ever used inside `tests/test_config.py` -- accepted as the
+  correct tradeoff over leaving provider keys sourced from a repo-root
+  `.env` permanently broken for the CLI path.
+
+- **Consequences:** `mcp/exceptions.py` gains `InvalidIndexDirError`.
+  `config.py` gains `_resolve_effective_source` (relocated),
+  `_canonicalize_repo_source`, `_resolve_index_dir`, `_resolve_env_path`,
+  and `_DOTENV_PATH`; its own eager dotenv load now goes through
+  `_resolve_env_path("", explicit=None)` instead of a bare
+  `load_dotenv(override=False)` call, degrading to the exact original
+  cwd-relative behavior for any bare `import config`. `mcp/server.py`'s
+  `_make_lifespan`/`_build_server`/`run` gain an additive `env_path`
+  keyword, purely so `_lifespan`'s new first-statement INFO-level startup
+  log can report the resolved `index_dir`, its repo-hash key, and which
+  `.env` (if any) was used -- `_lifespan`'s actual control flow is
+  otherwise unchanged, since by the time it runs `index_dir` is already
+  fully resolved by the caller. `pyproject.toml` gains `platformdirs` as
+  a new runtime dependency (small, zero transitive deps, actively
+  maintained, genuinely cross-platform -- the rejected alternative,
+  always requiring an absolute `--index-dir` with no default at all,
+  would reintroduce the same per-client manual per-project configuration
+  this whole effort exists to remove). Two `tests/test_cli.py` assertions
+  that hardcoded the old `INDEX_DIR`-as-argparse-default behavior were
+  updated, along with a third that used a relative `--index-dir` (now
+  rejected); both serve-dispatch tests also neutralize
+  `importlib.reload` via `monkeypatch`, since the real reload -- correct
+  in a real process -- would otherwise rebind `config.py`'s classes
+  mid-test-session and break `isinstance` checks in other test files that
+  had already imported the pre-reload class by name (discovered directly:
+  `tests/test_config.py::test_provider_keys_is_dataclass` failed only
+  when run after the new serve-dispatch tests, not in isolation). New
+  `tests/test_config_portability.py` (13 cases) covers `_resolve_index_dir`/
+  `_resolve_env_path` directly.
+
+- **Real end-to-end verification performed (not just unit tests):**
+  `codebase-rag serve --repo <same repo>` launched from two different,
+  unrelated real directories logged the identical resolved `index_dir`
+  both times (the new `_lifespan` startup log line); `codebase-rag index`
+  run against two different real repos (this checkout, and a small
+  synthetic second git repo) produced two distinct, non-colliding
+  `index_dir` hashes on disk. `pipx`/`uvx` are not installed on the dev
+  machine this was built on, so the "clean install outside the dev
+  `.venv`" check used an equivalent proxy -- a fresh throwaway venv with a
+  non-editable `pip install .` -- and `codebase-rag --version`/`serve`
+  both worked correctly from it, exercising the real `[project.scripts]`
+  entry point. A real `ask` MCP tool call, made over a real stdio
+  subprocess (via the MCP SDK's own `stdio_client`) launched with a
+  minimal environment containing only `PATH`/`HOME`/`GROQ_API_KEY` -- no
+  `.env` file anywhere reachable by `_resolve_env_path` -- logged
+  `env_file=none` yet still attempted a real Groq API call using that
+  key (failing on the same pre-existing, unrelated stale-model-name 404
+  this machine's real key already hits elsewhere in the test suite --
+  not a config-resolution failure), directly proving the "MCP client env
+  block, no `.env` anywhere" case works.
+
+- **Decision -- live Claude Desktop/Cursor connection tests not
+  performed; every documented client config recommends an explicit
+  `--repo` instead of relying on zero-config `cwd` detection:** this
+  session has no control over native GUI applications (only a Chrome
+  browser automation tool), so the actual subprocess `cwd` each client
+  launches with could not be empirically measured here, per explicit
+  user decision when asked how to close this out. Rather than guess or
+  leave the config snippets silently incomplete, every per-client
+  snippet in README's "Connect to an MCP client" section passes `--repo
+  <absolute-path>` explicitly -- which is unconditionally correct
+  regardless of that client's actual launch `cwd`, since `--repo` is the
+  first, unconditional tier of `_resolve_effective_source`'s precedence
+  (D-026). This makes the zero-config `.git`-gated cwd-detection path a
+  convenience for the dev-shell case only, never something a documented
+  client config silently depends on. If a user later confirms a specific
+  client does launch with `cwd` at the project root, `--repo` can be
+  dropped from that client's snippet as a documented simplification, not
+  a correctness fix.
+
+---
+
 ## D-001 · Adopt a src-layout with hatchling
 
 - **Date:** 2026-08-20

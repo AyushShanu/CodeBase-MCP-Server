@@ -49,6 +49,15 @@ class IndexBuildInProgressError(MCPServerError):
     a failure. Callers should retry shortly."""
 
 
+class InvalidIndexDirError(MCPServerError):
+    """Raised by `config._resolve_index_dir` when an explicit
+    `--index-dir`/`INDEX_DIR` value is given as a relative path -- rejected
+    outright rather than silently resolved against `cwd`, since a
+    `serve`/`index` invocation's `cwd` is exactly the launch-directory-
+    dependent property this day (13-cross-agent-mcp-packaging-portability)
+    exists to stop mattering."""
+
+
 class RepoRootUnknownError(MCPServerError):
     """Raised by `get_file_context` when no manifest was written for this
     index (an older index built before `indexing.manifest` existed, or one
@@ -79,6 +88,7 @@ __all__ = [
     "AutoIndexError",
     "IndexBuildInProgressError",
     "IndexNotAvailableError",
+    "InvalidIndexDirError",
     "InvalidLineRangeError",
     "MCPServerError",
     "PathOutsideRepoRootError",

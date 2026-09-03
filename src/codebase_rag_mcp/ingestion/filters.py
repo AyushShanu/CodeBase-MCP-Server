@@ -16,6 +16,7 @@ IGNORED_DIR_NAMES: Final[frozenset[str]] = frozenset(
         "node_modules",
         "build",
         "dist",
+        ".next",
         "coverage",
         ".venv",
         "venv",
