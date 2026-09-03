@@ -68,6 +68,7 @@ from typing import Any, Literal, NamedTuple
 from urllib.parse import urlparse
 
 from codebase_rag_mcp import config
+from codebase_rag_mcp.config import _resolve_effective_source  # re-exported for backward compat
 
 # --- stdout/stderr discipline: MUST run before any pipeline import below --- #
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -258,35 +259,6 @@ def _construct_embeddings(vector_index: VectorIndex | None) -> HuggingFaceEmbedd
     )
 
 
-def _resolve_effective_source(
-    *, repo_flag: str | None, repo_source_env: str, cwd: str | Path | None = None
-) -> str | None:
-    """Resolve the repo source zero-config auto-indexing should target, or
-    `None` if none can be safely inferred (Day 12).
-
-    Precedence: an explicit `--repo` flag, then a non-empty `REPO_SOURCE`
-    env var, then `cwd` itself -- but ONLY if `cwd` contains a `.git`
-    directory. The `.git` gate applies to this bare-`cwd` fallback tier
-    alone: an explicit `--repo`/`REPO_SOURCE` value (a local path or an
-    `https://` URL) is a deliberate user instruction and is honored as-is,
-    `.git` or not. Without the gate, launching `serve` from an arbitrary
-    directory (a home folder, a Downloads folder) with no explicit source
-    configured would silently scan and embed whatever happened to be
-    there.
-
-    `cwd` is a test seam -- production callers leave it `None`, resolving
-    the real `Path.cwd()`.
-    """
-    if repo_flag:
-        return repo_flag
-    if repo_source_env:
-        return repo_source_env
-    real_cwd = Path(cwd) if cwd is not None else Path.cwd()
-    if (real_cwd / ".git").exists():
-        return str(real_cwd)
-    return None
-
-
 def _manifest_matches_source(loaded_manifest: IndexManifest, effective_source: str) -> bool:
     """Does `loaded_manifest` already cover `effective_source` (Day 12)?
 
@@ -419,6 +391,7 @@ def _make_lifespan(
     repo_source: str | None = None,
     auto_index: bool = False,
     cwd: str | Path | None = None,
+    env_path: str | Path | None = None,
 ) -> Callable[[MCPServer[_ServerState]], AbstractAsyncContextManager[_ServerState]]:
     """Build a `lifespan` closure over `index_dir` (and, since Day 12,
     zero-config auto-indexing's `repo_source`/`auto_index`/`cwd`).
@@ -437,10 +410,24 @@ def _make_lifespan(
     `run()`, the real CLI entrypoint, carries the actual
     `config.AUTO_INDEX`-derived production default. `cwd` is a test seam,
     threaded straight through to `_resolve_effective_source`.
+
+    `env_path` (Day 13) is purely informational -- by the time `_lifespan`
+    runs, whatever `.env` file was going to be loaded has already been
+    loaded by the caller (`cli/main.py`'s `serve` dispatch resolves it and
+    reloads `config` *before* this module is even imported -- see
+    DECISIONS.md D-027). It exists only so `_lifespan`'s startup log can
+    tell an operator which `.env` path (if any) was actually used, without
+    re-deriving it here.
     """
 
     @asynccontextmanager
     async def _lifespan(server: MCPServer[_ServerState]) -> AsyncIterator[_ServerState]:
+        logger.info(
+            "codebase-rag-mcp resolving: index_dir=%s repo_hash_key=%s env_file=%s",
+            index_dir,
+            Path(index_dir).name,
+            env_path or "none (no .env used; provider keys expected from process environment)",
+        )
         vector_index, bm25_index, loaded_manifest, loaded_reference_index = _load_ready_indexes(
             index_dir
         )
@@ -636,6 +623,7 @@ def _build_server(
     | None = None,
     repo_source: str | None = None,
     auto_index: bool = False,
+    env_path: str | Path | None = None,
 ) -> MCPServer[_ServerState]:
     """Construct a fresh `MCPServer` with all six tools registered (V1's
     four, Day 10's `analyze_impact`, Day 11's `repository_summary`), each
@@ -650,14 +638,20 @@ def _build_server(
     overridden -- like `index_dir`, they're ignored when a caller supplies
     its own `lifespan`. `auto_index` defaults to `False` here, not
     `config.AUTO_INDEX` -- see `_make_lifespan`'s own docstring for why;
-    `run()` alone carries the real production default.
+    `run()` alone carries the real production default. `env_path` (Day 13)
+    is forwarded the same way, purely for `_lifespan`'s startup log.
     """
     server: MCPServer[_ServerState] = MCPServer(
         SERVER_NAME,
         version=_VERSION,
         lifespan=lifespan
         if lifespan is not None
-        else _make_lifespan(index_dir=index_dir, repo_source=repo_source, auto_index=auto_index),
+        else _make_lifespan(
+            index_dir=index_dir,
+            repo_source=repo_source,
+            auto_index=auto_index,
+            env_path=env_path,
+        ),
     )
 
     @server.tool()
@@ -802,6 +796,7 @@ def run(
     repo_source: str | None = None,
     index_dir: str | Path = config.INDEX_DIR,
     auto_index: bool = config.AUTO_INDEX,
+    env_path: str | Path | None = None,
 ) -> None:
     """Synchronous entrypoint used by the CLI's `serve` subcommand.
 
@@ -809,10 +804,15 @@ def run(
     site where the real, environment-driven zero-config auto-indexing
     default (Day 12) actually takes effect; `_build_server`/`_make_lifespan`
     themselves default `auto_index` to `False` for test isolation (see
-    their own docstrings).
+    their own docstrings). `env_path` (Day 13) is the `.env` file
+    `cli/main.py` actually resolved and loaded (if any) before calling this
+    function -- forwarded through purely so `_lifespan`'s startup log can
+    report it.
     """
     logger.info("Starting %s v%s", SERVER_NAME, _VERSION)
-    _build_server(index_dir=index_dir, repo_source=repo_source, auto_index=auto_index).run()
+    _build_server(
+        index_dir=index_dir, repo_source=repo_source, auto_index=auto_index, env_path=env_path
+    ).run()
 
 
 __all__ = ["SERVER_NAME", "run"]

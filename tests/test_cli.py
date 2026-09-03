@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
 import pytest
 
+from codebase_rag_mcp import config
 from codebase_rag_mcp.cli.main import _build_parser, _run_index, main
 from codebase_rag_mcp.config import INDEX_DIR
 from codebase_rag_mcp.indexing import repo as repo_module
@@ -70,7 +72,9 @@ def test_build_parser_serve_defaults_when_no_flags_given() -> None:
     args = parser.parse_args(["serve"])
 
     assert args.repo is None
-    assert args.index_dir == INDEX_DIR
+    # Day 13: no default value is baked into argparse anymore -- `None` is
+    # the sentinel `main()` resolves explicitly via `config._resolve_index_dir`.
+    assert args.index_dir is None
     assert args.no_auto_index is False
 
 
@@ -150,32 +154,92 @@ def test_main_dispatches_index_with_force_flag_end_to_end(
 
 
 def test_main_dispatches_serve_with_repo_index_dir_and_auto_index_flag_threaded_through(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Day 13: `main()` now resolves `--repo`/`--index-dir`/`.env` before
+    # dispatching -- chdir to an isolated, `.git`-less, `.env`-less tmp_path
+    # so this test's outcome doesn't depend on this machine's real cwd/.env
+    # (this repo's own checkout has both). A relative `--index-dir` is now
+    # rejected outright, so this test uses an absolute one.
+    monkeypatch.chdir(tmp_path)
+    # `main()`'s serve dispatch calls the real `importlib.reload(config)` --
+    # correct in a real process (fresh each run), but reloading the actual
+    # `codebase_rag_mcp.config` module here would rebind classes like
+    # `ProviderKeys` to new objects mid-test-session, breaking `isinstance`
+    # checks in other test files that already imported the pre-reload
+    # class by name (e.g. tests/test_config.py). This test only checks
+    # argument plumbing, not reload's effect, so neutralize it.
+    monkeypatch.setattr(importlib, "reload", lambda module: module)
     calls: list[dict[str, object]] = []
 
-    def fake_run(*, repo_source: str | None, index_dir: object, auto_index: bool) -> None:
-        calls.append({"repo_source": repo_source, "index_dir": index_dir, "auto_index": auto_index})
+    def fake_run(
+        *, repo_source: str | None, index_dir: object, auto_index: bool, env_path: object = None
+    ) -> None:
+        calls.append(
+            {
+                "repo_source": repo_source,
+                "index_dir": index_dir,
+                "auto_index": auto_index,
+                "env_path": env_path,
+            }
+        )
 
     monkeypatch.setattr(server_module, "run", fake_run)
 
-    exit_code = main(["serve", "--repo", "some/path", "--index-dir", "idx-dir", "--no-auto-index"])
+    absolute_index_dir = str(tmp_path / "idx-dir")
+    exit_code = main(
+        ["serve", "--repo", "some/path", "--index-dir", absolute_index_dir, "--no-auto-index"]
+    )
 
     assert exit_code == 0
-    assert calls == [{"repo_source": "some/path", "index_dir": "idx-dir", "auto_index": False}]
+    assert calls == [
+        {
+            "repo_source": "some/path",
+            "index_dir": Path(absolute_index_dir),
+            "auto_index": False,
+            "env_path": None,
+        }
+    ]
 
 
 def test_main_dispatches_serve_with_auto_index_true_by_default(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Day 13: isolate cwd (no .git, no .env) and REPO_SOURCE so
+    # `_resolve_effective_source` deterministically resolves to `None`
+    # regardless of this machine's real checkout/.env state, and the
+    # no-explicit-index-dir case deterministically falls back to the
+    # static `config.INDEX_DIR` default.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config, "REPO_SOURCE", "")
+    # See the previous test's comment: neutralize the real
+    # `importlib.reload(config)` `main()` performs, to avoid rebinding
+    # `codebase_rag_mcp.config`'s classes mid-test-session.
+    monkeypatch.setattr(importlib, "reload", lambda module: module)
     calls: list[dict[str, object]] = []
 
-    def fake_run(*, repo_source: str | None, index_dir: object, auto_index: bool) -> None:
-        calls.append({"repo_source": repo_source, "index_dir": index_dir, "auto_index": auto_index})
+    def fake_run(
+        *, repo_source: str | None, index_dir: object, auto_index: bool, env_path: object = None
+    ) -> None:
+        calls.append(
+            {
+                "repo_source": repo_source,
+                "index_dir": index_dir,
+                "auto_index": auto_index,
+                "env_path": env_path,
+            }
+        )
 
     monkeypatch.setattr(server_module, "run", fake_run)
 
     exit_code = main(["serve"])
 
     assert exit_code == 0
-    assert calls == [{"repo_source": None, "index_dir": INDEX_DIR, "auto_index": True}]
+    assert calls == [
+        {
+            "repo_source": None,
+            "index_dir": Path(INDEX_DIR),
+            "auto_index": True,
+            "env_path": None,
+        }
+    ]

@@ -100,6 +100,10 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` complete.
 
 - [ ] **12 — Final QA & Open-Source Packaging** — `feature/final-packaging`
   Clean-clone install test, index the final demo repo, full test run, all four benchmark questions verified end-to-end with correct citations, finalize README/diagram/demo GIF, confirm MIT license, write resume bullets, tag `v1.0.0`.
+  *(Note: the `day_number=12` slot in `.claude/specs/` was actually filed against zero-config auto-indexing, added on top of an already-further-along repo state, per an explicit user request — see `DECISIONS.md` D-026. This entry's original scope — clean-clone QA, README/demo polish, tagging `v1.0.0` — remains unbuilt.)*
+
+- [ ] **13 — Cross-Agent MCP Packaging & Portability** — `feature/cross-agent-mcp-packaging-portability`
+  Added post-plan-window per an explicit user request (see `DECISIONS.md`) — not part of the original 20–31 Aug plan. Make the stdio MCP server reliably launchable by *any* MCP-compatible client (Claude Code, Claude Desktop, Cursor, Windsurf, Cline, generic stdio hosts), not just the dev shell it was built and tested in: stop `DATA_DIR`/`INDEX_DIR`/`.env` resolution from silently depending on the launching client's working directory, verify `pip`/`pipx`/`uvx` install and launch, and publish ready-to-copy per-client config snippets.
 
 *Optional add-ons, not separate roadmap days — fold into the relevant day above if time allows: swap FAISS → Qdrant (Day 4/12) for the stronger resume line; ship the fully-offline local-LLM mode via Ollama/MLX (Day 7/9).*
 

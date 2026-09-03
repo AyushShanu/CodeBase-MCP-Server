@@ -68,6 +68,20 @@ flowchart LR
 to `INDEX_DIR`, and exit. Subsequent `codebase-rag serve` invocations
 load the persisted indexes instead of rebuilding them.
 
+As of Day 13 (13-cross-agent-mcp-packaging-portability, see DECISIONS.md
+D-027), `INDEX_DIR` is no longer a single fixed `./data/index` by
+default: `cli/main.py`'s `index`/`serve` dispatch resolves it via
+`config._resolve_index_dir(repo_source, explicit)` to a path keyed by a
+hash of the *resolved repo source* under an OS-appropriate
+`platformdirs.user_data_dir("codebase-rag")/index/<hash>/` directory —
+the same repo always resolves to the same `INDEX_DIR` regardless of which
+directory or MCP client launched the process, and two different repos
+never collide. An explicit `--index-dir`/`INDEX_DIR` always overrides
+this and must be absolute (a relative value is rejected outright). The
+static `./data/index` default (`config.INDEX_DIR`) still exists as the
+fallback for direct/library/test use of `indexing/*` and for the narrow
+case where no repo source can be resolved at all.
+
 Ingestion (`ingestion/loader.py` → `ingestion/filters.py` /
 `ingestion/languages.py` → `ingestion/scanner.py`) accepts either an
 `https://` GitHub URL — shallow-cloned via `subprocess` + the system
@@ -164,9 +178,9 @@ flowchart TD
     D3 --> E[indexing.vector<br/>embed_chunks -> build_index<br/>all-MiniLM-L6-v2, batched + L2-normalized]
     D3 --> F[indexing.bm25<br/>tokenize -> BM25Okapi build_index]
     D3 --> I[indexing.references<br/>build_index -> write_index<br/>grouped by_name / imports lookup]
-    E --> G[("data/index/<br/>vector.faiss + vector_metadata.json")]
-    F --> H[("data/index/<br/>bm25.pkl + bm25_metadata.json")]
-    I --> J[("data/index/<br/>references.json")]
+    E --> G[("INDEX_DIR/<br/>vector.faiss + vector_metadata.json")]
+    F --> H[("INDEX_DIR/<br/>bm25.pkl + bm25_metadata.json")]
+    I --> J[("INDEX_DIR/<br/>references.json")]
 ```
 
 `parse_file`/`chunk_file` are exercised directly by
@@ -621,5 +635,12 @@ configured provider.
 | Logs          | stderr / `LOG_LEVEL`                   | `cli`, `mcp`     |
 | Caches        | `.cache/`, `.mypy_cache/`, `.ruff_cache/` (gitignored) | tooling  |
 
-Anything in `data/` or matching `*.faiss` / `*.index` is gitignored —
-indexes are reproducible from source and should not be committed.
+`INDEX_DIR` (Day 13, DECISIONS.md D-027) defaults to a per-repo-hash-keyed
+path under the OS user-data directory (`platformdirs.user_data_dir
+("codebase-rag")/index/<hash>/`) — outside the repo checkout entirely, so
+nothing there needs gitignoring. An explicit `--index-dir`/`INDEX_DIR`
+always overrides this and must be absolute (a relative value is rejected
+outright). `DATA_DIR` (clone staging, still `./data` by default) is
+unaffected by this change. Anything in `data/` or matching `*.faiss` /
+`*.index` remains gitignored — indexes are reproducible from source and
+should not be committed.
