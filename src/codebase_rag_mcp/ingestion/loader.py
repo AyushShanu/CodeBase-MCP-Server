@@ -75,7 +75,14 @@ def load_repo(source: str, *, clone_timeout: float = DEFAULT_CLONE_TIMEOUT_SECON
     `LocalPathNotADirectoryError` for a bad local path.
     """
     parsed = urlparse(source)
-    if parsed.scheme:
+    # A Windows absolute path like "C:\Users\..." also parses as having a
+    # scheme ("c") under `urlparse`, since it matches the same `x:...`
+    # pattern as a real URL. Every IANA-registered URL scheme is 2+
+    # characters (https, ssh, git, ...), while a Windows drive letter is
+    # always exactly 1 -- so a single-character "scheme" is never a real
+    # URL and must fall through to the local-path branch below, not be
+    # rejected as a disallowed one.
+    if parsed.scheme and len(parsed.scheme) > 1:
         scheme = parsed.scheme.lower()
         if scheme not in ALLOWED_URL_SCHEMES:
             raise InvalidRepoURLError(

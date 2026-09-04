@@ -58,13 +58,32 @@ def resolve_grammar_name(language: str, *, path: Path | None = None) -> str:
 @cache
 def _cached_parser(grammar_name: str) -> Parser:
     logger.info("constructing Tree-sitter parser for grammar %r", grammar_name)
-    return get_parser(grammar_name)  # type: ignore[no-any-return]
+    try:
+        return get_parser(grammar_name)  # type: ignore[no-any-return]
+    except Exception as exc:
+        # tree_sitter_language_pack lazily downloads each grammar's native
+        # binary on first use rather than bundling it -- a network timeout,
+        # a blocked download host, or a corrupted local cache all surface
+        # here as some tree_sitter_language_pack-internal exception (e.g.
+        # DownloadError), never as ParseError/UnsupportedLanguageError.
+        # Both callers of parse_file already treat those two as "skip this
+        # one file, keep indexing the rest" -- converting any acquisition
+        # failure into ParseError right at this boundary means a single
+        # flaky download degrades gracefully instead of aborting the
+        # entire index run. See the Windows DownloadError incident.
+        raise ParseError(
+            f"could not acquire Tree-sitter parser for grammar {grammar_name!r}: {exc}"
+        ) from exc
 
 
 @cache
 def _cached_language(grammar_name: str) -> Language:
-    return get_language(grammar_name)  # type: ignore[no-any-return]
-
+    try:
+        return get_language(grammar_name)  # type: ignore[no-any-return]
+    except Exception as exc:
+        raise ParseError(
+            f"could not acquire Tree-sitter language for grammar {grammar_name!r}: {exc}"
+        ) from exc
 
 def get_cached_parser(grammar_name: str) -> Parser:
     """Return a cached `Parser` for an already-resolved grammar name."""
