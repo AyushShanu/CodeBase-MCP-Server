@@ -26,7 +26,7 @@ from typing import Final
 from tree_sitter import Language, Parser
 from tree_sitter_language_pack import get_language, get_parser
 
-from codebase_rag_mcp.parser.exceptions import UnsupportedLanguageError
+from codebase_rag_mcp.parser.exceptions import ParseError, UnsupportedLanguageError
 
 logger = logging.getLogger(__name__)
 
